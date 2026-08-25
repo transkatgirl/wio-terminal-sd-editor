@@ -1,0 +1,30 @@
+[package]
+name = "wio-terminal-sd-editor"
+version = "0.1.0"
+edition = "2021"
+description = "Interactive SD-card file explorer and text editor for the Seeed Studio Wio Terminal"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+chip = "ATSAMD51P19A"
+
+[dependencies]
+embedded-io = "0.7"
+embedded-sdmmc = "=0.9.0"
+unifat = { version = "=0.1.0", default-features = false }
+
+[target.'cfg(target_arch = "arm")'.dependencies]
+cortex-m = "0.7"
+embedded-graphics = "0.8.1"
+embedded-hal = "1"
+embedded-alloc = { version = "0.7", default-features = false, features = ["llff"] }
+mousefood = { version = "0.5.2", default-features = false }
+panic-halt = "0.2"
+ratatui = { version = "0.30.2", default-features = false }
+wio_terminal = { version = "0.9.0", default-features = false, features = ["rt", "wifi"] }
+
+[profile.release]
+debug = true
+lto = true
+opt-level = "s"
