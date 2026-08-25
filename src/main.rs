@@ -819,7 +819,7 @@ mod firmware {
             .data_in(sd_pins.miso)
             .sclk(sd_pins.sck);
         let sd_bus = spi::Config::new(
-            &mut peripherals.mclk,
+            &peripherals.mclk,
             peripherals.sercom6,
             pads,
             _sd_clock.freq(),
@@ -958,7 +958,7 @@ mod firmware {
         // this read is temporarily unavailable instead of hiding the chassis.
         let charging = i2c
             .read_word(BQ27441_AVERAGE_CURRENT)
-            .map_or(false, |current| current as i16 > 0);
+            .is_some_and(|current| current as i16 > 0);
         Some(BatteryStatus {
             percent: percent as u8,
             charging,
