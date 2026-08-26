@@ -46,8 +46,10 @@ mod firmware {
         format_fat32, is_txt_file, join_path, leaf_name, parent_path, probe_fat,
         save_failure_reason, sd_retry, validate_entry_name, validate_file_stem, Button, CardFs,
         DirectoryItem, EditError, FsOpError, InputEngine, Key, Keyboard, ProbeError,
-        RawButtons, SdStream, TextBuffer, EXPLORER_PAGE_ROWS, MAX_DOCUMENT_BYTES,
-        MAX_ENTRY_NAME_CHARS, MAX_FILE_STEM_CHARS, OLD_ENTRY_REMAINS, SD_RETRY_ATTEMPTS,
+        RawButtons, SdStream, TextBuffer, CREATE_FAILED_PREFIX, DELETE_INCOMPLETE_PREFIX,
+        DELETE_UNCONFIRMED, EXPLORER_PAGE_ROWS, MAX_DOCUMENT_BYTES, MAX_ENTRY_NAME_CHARS,
+        MAX_FILE_STEM_CHARS, MOVE_FAILED_PREFIX, NOT_DELETED_PREFIX, OLD_ENTRY_REMAINS,
+        RENAME_FAILED_PREFIX, SAVE_FAILED_KEPT_PREFIX, SAVE_FAILED_PREFIX, SD_RETRY_ATTEMPTS,
     };
 
     const HEAP_SIZE: usize = 112 * 1024;
@@ -167,10 +169,17 @@ mod firmware {
         /// in failure: the card is almost certainly gone or dead, and
         /// paying three attempts plus two lazy ~400 kHz re-inits per block
         /// would freeze the event loop for minutes during a directory
-        /// walk. While set, each operation makes ONE bare attempt (no
-        /// retries, no recovery) and any success clears the latch. Shared
-        /// across clones; card-detect remounts build fresh devices, which
-        /// is what resets it for a new card.
+        /// walk. While set, each operation makes ONE attempt; a success
+        /// clears the latch, a failure re-preps the bus -- never the init
+        /// mark, which would put every later bare attempt through a full
+        /// slow-clock lazy re-init -- so a card left mid-command can
+        /// recover on a later access while a dead one keeps failing
+        /// fast. The lone attempt is not instant when the card was never
+        /// acquired -- one that died during acquire still pays the lazy
+        /// re-init per attempt -- but never the whole
+        /// attempts-plus-recoveries cycle. Shared across clones;
+        /// card-detect remounts build fresh devices, which is what resets
+        /// it for a new card.
         dead: Rc<Cell<bool>>,
     }
 
@@ -188,12 +197,19 @@ mod firmware {
             controller.mark_card_uninit();
         }
 
+        /// Re-prep the bus without touching the card's init mark: enough
+        /// to walk a card left mid-command back to command state, but
+        /// never the trigger for a lazy re-init (see the dead branch in
+        /// `run`, which must fail fast).
+        fn resync_bus(&self) {
+            let _ = self.controller.borrow().spi(|device| device.prepare_card());
+        }
+
         // Single SPI exchanges flake on real cards, so every access gets
         // the standard retry policy. Recovery between attempts re-preps
         // and re-initializes the card, which is what lets the next attempt
         // succeed; a card that survives a whole cycle of that is declared
-        // dead (see the `dead` field) instead of being recovered one last
-        // time, so the next operation fails fast.
+        // dead (see the `dead` field) and drops to one attempt per access.
         fn run<T>(
             &self,
             mut op: impl FnMut(&Controller) -> Result<T, embedded_sdmmc::SdCardError>,
@@ -202,6 +218,17 @@ mod firmware {
                 let result = op(&self.controller.borrow());
                 if result.is_ok() {
                     self.dead.set(false);
+                } else {
+                    // A failure after a successful acquire can leave the
+                    // card mid-command, and no later bare attempt could
+                    // succeed on a healthy-but-desynced bus without a bus
+                    // re-prep (only a bare success, or a physical reseat,
+                    // clears the latch). Only the bus, though: marking
+                    // the card uninit would make every later bare attempt
+                    // pay a full slow-clock lazy re-init, freezing the
+                    // event loop for the very stretches the latch exists
+                    // to prevent.
+                    self.resync_bus();
                 }
                 return result;
             }
@@ -209,10 +236,9 @@ mod firmware {
             let result = sd_retry(|| {
                 attempt += 1;
                 let result = op(&self.controller.borrow());
-                // Recover only *between* attempts: after the final failure
-                // the card is declared dead and must fail fast, not be left
-                // marked-uninit to pay a full slow-clock lazy re-init on
-                // every bare attempt while the latch holds.
+                // Recover only *between* attempts here; after the final
+                // failure the dead branch above owns the
+                // recover-after-failure policy at one attempt per access.
                 if result.is_err() && attempt < SD_RETRY_ATTEMPTS {
                     self.recover_card();
                 }
@@ -499,10 +525,11 @@ mod firmware {
         }
     }
 
-    /// A copy-based filesystem operation slow enough to warrant a blocking
-    /// "working" notice: `handle_button` returns it as [`HandleResult::Op`],
-    /// and the event loop paints the notice before running it synchronously
-    /// via `run_fs_op` (same pattern as Mounting/Formatting).
+    /// A filesystem operation slow enough to warrant a blocking "working"
+    /// notice (a copy-based rename/move/delete, or the transactional
+    /// save): `handle_button` returns it as [`HandleResult::Op`], and the
+    /// event loop paints the notice before running it synchronously via
+    /// `run_fs_op` (same pattern as Mounting/Formatting).
     enum PendingFsOp {
         Rename {
             entry: NameEntry,
@@ -516,6 +543,12 @@ mod firmware {
             explorer: Explorer,
             item: DirectoryItem,
         },
+        Save {
+            editor: Editor,
+            /// Exit-on-success semantics from the exit dialog: land on the
+            /// explorer only if the save verifiably reached the card.
+            exit_after: bool,
+        },
     }
 
     impl PendingFsOp {
@@ -524,6 +557,7 @@ mod firmware {
                 Self::Rename { .. } => "RENAMING",
                 Self::Move { .. } => "MOVING",
                 Self::Delete { .. } => "DELETING",
+                Self::Save { .. } => "SAVING",
             }
         }
     }
@@ -595,9 +629,6 @@ mod firmware {
         Mounting,
         FormatPrompt {
             reason: &'static str,
-            /// Set by TOP LEFT; disarms the confirmation hold until TOP
-            /// RIGHT re-arms it.
-            cancelled: bool,
             /// RTC tick when this prompt appeared. The confirmation hold only
             /// counts presses that began at or after this moment.
             opened_at: u32,
@@ -619,6 +650,11 @@ mod firmware {
             choice: ExitChoice,
         },
         Fatal(&'static str),
+        /// A seated card whose mount was declined from the format prompt.
+        /// Deliberately not `Missing`: the event loop's retry-mount fires
+        /// only on `Missing`, so this state rests until the card is
+        /// physically removed (card detect maps it to `Missing` then).
+        Unusable(&'static str),
     }
 
     /// What a button press produced: the next screen, or a slow filesystem
@@ -996,7 +1032,9 @@ mod firmware {
             // on Missing while an unmountable card stayed in the slot. Card
             // detection is edge-triggered, so retry the mount here; this
             // cannot loop because every mount failure leaves a non-Missing
-            // screen (FormatPrompt or Fatal).
+            // screen (FormatPrompt or Fatal). A declined format prompt rests
+            // on Unusable, which this block deliberately does not match --
+            // remounting there would bounce straight back into the prompt.
             if volume.is_none() && last_present && matches!(screen, Screen::Missing) {
                 let previous_screen = mem::replace(&mut screen, Screen::Mounting);
                 terminal.draw(|frame| draw(frame, &screen, battery)).ok();
@@ -1023,25 +1061,20 @@ mod firmware {
             if let Some(button) = input.update(raw, now) {
                 screen = match handle_button(screen, button, &mut volume, mounted_identity) {
                     HandleResult::Screen(next) => next,
-                    // A pending rename/move runs synchronously; paint the
-                    // busy notice before starting so the display does not
-                    // freeze on the old screen.
+                    // A pending filesystem operation runs synchronously;
+                    // paint the busy notice before starting so the display
+                    // does not freeze on the old screen.
                     HandleResult::Op(op) => {
                         terminal
                             .draw(|frame| draw_busy(frame, op.title(), battery))
                             .ok();
-                        run_fs_op(op, &mut volume)
+                        run_fs_op(op, &volume)
                     }
                 };
                 dirty = true;
             }
 
-            if let Screen::FormatPrompt {
-                cancelled: false,
-                opened_at,
-                ..
-            } = &screen
-            {
+            if let Screen::FormatPrompt { opened_at, .. } = &screen {
                 let opened_at = *opened_at;
                 let held = input.held_ticks(Button::TopRight, now);
                 // The press must have started at or after the prompt appeared
@@ -1241,7 +1274,6 @@ mod firmware {
                 MountFailure::Invalid => "Invalid or damaged filesystem",
                 MountFailure::Io => unreachable!(),
             },
-            cancelled: false,
             opened_at: now,
         }
     }
@@ -1307,30 +1339,13 @@ mod firmware {
                 item,
                 choice,
             } => handle_delete_prompt(explorer, item, choice, button),
-            Screen::Editor(editor) => handle_editor(editor, button, volume).into(),
-            Screen::ExitPrompt { editor, choice } => {
-                handle_exit(editor, choice, button, volume).into()
+            Screen::Editor(editor) => handle_editor(editor, button, volume),
+            Screen::ExitPrompt { editor, choice } => handle_exit(editor, choice, button, volume),
+            // Declining the format is a full exit; Unusable rests until the
+            // card is physically removed, so a stray hold can never format.
+            Screen::FormatPrompt { reason, .. } if button == Button::TopLeft => {
+                Screen::Unusable(reason).into()
             }
-            Screen::FormatPrompt {
-                reason, opened_at, ..
-            } if button == Button::TopLeft => Screen::FormatPrompt {
-                reason,
-                cancelled: true,
-                opened_at,
-            }
-            .into(),
-            // A retry needs no fresh opened_at: it fires on a new press event,
-            // so that press necessarily began after the prompt opened.
-            Screen::FormatPrompt {
-                reason,
-                cancelled: true,
-                opened_at,
-            } if button == Button::TopRight => Screen::FormatPrompt {
-                reason,
-                cancelled: false,
-                opened_at,
-            }
-            .into(),
             Screen::Fatal(_) if button == Button::TopRight => Screen::Missing.into(),
             other => other.into(),
         }
@@ -1372,7 +1387,7 @@ mod firmware {
 
     fn move_outcome(
         result: Result<(), FsOpError<embedded_sdmmc::SdCardError>>,
-        fail_verb: &str,
+        fail_prefix: &'static str,
         exists_status: &str,
     ) -> MoveOutcome {
         match result {
@@ -1385,25 +1400,43 @@ mod firmware {
                 }
             }
             Err(FsOpError::AlreadyExists) => MoveOutcome::Rejected(exists_status.into()),
-            Err(error) => MoveOutcome::Rejected(format!(
-                "{fail_verb} failed: {}",
-                save_failure_reason(&error)
-            )),
+            Err(error) => {
+                MoveOutcome::Rejected(format!("{fail_prefix}{}", save_failure_reason(&error)))
+            }
         }
     }
 
-    /// Run the rename/move a [`HandleResult::Op`] carries. The event loop
-    /// calls this right after painting the busy notice.
-    fn run_fs_op(op: PendingFsOp, volume: &mut Option<Fs>) -> Screen {
-        let Some(card) = volume.as_ref() else {
-            return Screen::Missing;
-        };
-        match op {
-            PendingFsOp::Rename { mut entry, destination } => {
+    /// Run the filesystem operation a [`HandleResult::Op`] carries. The
+    /// event loop calls this right after painting the busy notice.
+    fn run_fs_op(op: PendingFsOp, volume: &Option<Fs>) -> Screen {
+        match (op, volume.as_ref()) {
+            // A save never takes the generic missing-card bailout below:
+            // Screen::Missing would discard the document's only copy
+            // (save_editor handles the missing card by setting a status).
+            (PendingFsOp::Save { mut editor, exit_after }, card) => {
+                let saved = save_editor(&mut editor, volume);
+                if !exit_after {
+                    Screen::Editor(editor)
+                } else if saved {
+                    if let Some(card) = card {
+                        editor.explorer.refresh(card);
+                    }
+                    Screen::Explorer(editor.explorer)
+                } else {
+                    // Stay on the dialog; it repeats editor.status as the
+                    // failure feedback.
+                    Screen::ExitPrompt {
+                        editor,
+                        choice: ExitChoice::Save,
+                    }
+                }
+            }
+            (_, None) => Screen::Missing,
+            (PendingFsOp::Rename { mut entry, destination }, Some(card)) => {
                 let source = entry.source.as_ref().expect("rename has a source");
                 match move_outcome(
                     card.move_entry_verified(&source.path, &destination),
-                    "Rename",
+                    RENAME_FAILED_PREFIX,
                     "That name already exists",
                 ) {
                     MoveOutcome::Done { source_remains } => {
@@ -1415,10 +1448,10 @@ mod firmware {
                     }
                 }
             }
-            PendingFsOp::Move { mut picker, destination } => {
+            (PendingFsOp::Move { mut picker, destination }, Some(card)) => {
                 match move_outcome(
                     card.move_entry_verified(&picker.source.path, &destination),
-                    "Move",
+                    MOVE_FAILED_PREFIX,
                     "That name already exists here",
                 ) {
                     MoveOutcome::Done { source_remains } => {
@@ -1434,7 +1467,7 @@ mod firmware {
                     }
                 }
             }
-            PendingFsOp::Delete { mut explorer, item } => {
+            (PendingFsOp::Delete { mut explorer, item }, Some(card)) => {
                 match card.delete_verified(&item.path, item.is_dir) {
                     Ok(()) => {
                         explorer.refresh(card);
@@ -1452,8 +1485,13 @@ mod firmware {
                             // "incomplete" is the truth ("Delete
                             // incomplete: data removed" is 31 columns).
                             FsOpError::DeleteIncomplete(_) => {
-                                format!("Delete incomplete: {}", save_failure_reason(&error))
+                                format!("{DELETE_INCOMPLETE_PREFIX}{}", save_failure_reason(&error))
                             }
+                            // The delete's absence check could not confirm
+                            // either way; the removal may have landed, so
+                            // assert uncertainty, never non-deletion --
+                            // the refreshed listing alongside is the truth.
+                            FsOpError::VerifyFailed => DELETE_UNCONFIRMED.into(),
                             // Refusals (read-only, non-empty folder, not
                             // found...) destroyed nothing; saying
                             // "incomplete" would claim partial destruction
@@ -1461,7 +1499,7 @@ mod firmware {
                             // longest common reason ("folder is not empty")
                             // is exactly 32 columns; rarer long reasons
                             // clip via truncate.
-                            _ => format!("Not deleted: {}", save_failure_reason(&error)),
+                            _ => format!("{NOT_DELETED_PREFIX}{}", save_failure_reason(&error)),
                         });
                     }
                 }
@@ -1697,7 +1735,7 @@ mod firmware {
                         }
                         Err(error) => {
                             entry.status =
-                                Some(format!("Create failed: {}", save_failure_reason(&error)))
+                                Some(format!("{CREATE_FAILED_PREFIX}{}", save_failure_reason(&error)))
                         }
                     }
                 }
@@ -1714,7 +1752,7 @@ mod firmware {
                         }
                         Err(error) => {
                             entry.status =
-                                Some(format!("Create failed: {}", save_failure_reason(&error)))
+                                Some(format!("{CREATE_FAILED_PREFIX}{}", save_failure_reason(&error)))
                         }
                     }
                 }
@@ -1866,7 +1904,11 @@ mod firmware {
         .into()
     }
 
-    fn handle_editor(mut editor: Editor, button: Button, volume: &mut Option<Fs>) -> Screen {
+    fn handle_editor(
+        mut editor: Editor,
+        button: Button,
+        volume: &mut Option<Fs>,
+    ) -> HandleResult {
         match button {
             Button::TopLeft => {
                 // The dialog repeats editor.status as save feedback, so a
@@ -1875,11 +1917,19 @@ mod firmware {
                 return Screen::ExitPrompt {
                     editor,
                     choice: ExitChoice::Cancel,
-                };
+                }
+                .into();
             }
             Button::TopMiddle => editor.keyboard_visible = !editor.keyboard_visible,
             Button::TopRight => {
-                save_editor(&mut editor, volume);
+                // Guard refusals are instant; only a save that will
+                // actually touch the card earns the busy notice.
+                if save_gate(&mut editor, volume).is_some() {
+                    return HandleResult::Op(PendingFsOp::Save {
+                        editor,
+                        exit_after: false,
+                    });
+                }
             }
             _ if editor.keyboard_visible => {
                 if !move_keyboard(&mut editor.keyboard, button) && button == Button::Click {
@@ -1915,11 +1965,16 @@ mod firmware {
             Button::Click => editor.keyboard_visible = true,
         }
         editor.ensure_cursor_visible();
-        Screen::Editor(editor)
+        Screen::Editor(editor).into()
     }
 
-    /// Returns whether the document verifiably reached the card.
-    fn save_editor(editor: &mut Editor, volume: &mut Option<Fs>) -> bool {
+    /// The one gate between a save request and the card: sets the status
+    /// explaining why the save cannot reach the card and returns `None`,
+    /// or hands back the card to save to. Shared by the editor/exit
+    /// handlers (a refusal this instant must not flash the SAVING notice)
+    /// and `save_editor` itself, so the guard and the save can never
+    /// disagree about what reaches the card.
+    fn save_gate<'a>(editor: &mut Editor, volume: &'a Option<Fs>) -> Option<&'a Fs> {
         if editor.media != EditorMedia::Ready {
             editor.status = Some(
                 match editor.media {
@@ -1929,10 +1984,18 @@ mod firmware {
                 }
                 .into(),
             );
-            return false;
+            return None;
         }
         let Some(card) = volume.as_ref() else {
             editor.status = Some("SD card is unavailable".into());
+            return None;
+        };
+        Some(card)
+    }
+
+    /// Returns whether the document verifiably reached the card.
+    fn save_editor(editor: &mut Editor, volume: &Option<Fs>) -> bool {
+        let Some(card) = save_gate(editor, volume) else {
             return false;
         };
         match card.save_transactional(&editor.path, editor.buffer.bytes()) {
@@ -1948,8 +2011,8 @@ mod firmware {
                     // prompt's 30-column repeat of it. The surviving backup
                     // is the actionable fact for a save whose target may be
                     // partial.
-                    Some(backup) => format!("Save failed; kept {}", leaf_name(backup)),
-                    None => format!("Save failed: {}", save_failure_reason(&error.error)),
+                    Some(backup) => format!("{SAVE_FAILED_KEPT_PREFIX}{}", leaf_name(backup)),
+                    None => format!("{SAVE_FAILED_PREFIX}{}", save_failure_reason(&error.error)),
                 });
                 false
             }
@@ -1961,36 +2024,37 @@ mod firmware {
         mut choice: ExitChoice,
         button: Button,
         volume: &mut Option<Fs>,
-    ) -> Screen {
+    ) -> HandleResult {
         match button {
             Button::Left | Button::Up => choice = choice.left(),
             Button::Right | Button::Down => choice = choice.right(),
-            Button::TopLeft => return Screen::Editor(editor),
+            Button::TopLeft => return Screen::Editor(editor).into(),
             Button::Click => match choice {
-                ExitChoice::Cancel => return Screen::Editor(editor),
+                ExitChoice::Cancel => return Screen::Editor(editor).into(),
                 ExitChoice::Discard => {
                     if let Some(card) = volume.as_ref() {
                         editor.explorer.refresh(card);
-                        return Screen::Explorer(editor.explorer);
+                        return Screen::Explorer(editor.explorer).into();
                     }
-                    return Screen::Missing;
+                    return Screen::Missing.into();
                 }
                 ExitChoice::Save => {
-                    // Exit only on a verified save. Dirtiness is not a success
-                    // proxy: a failed save of a never-modified buffer would
+                    // Exit only on a verified save (run_fs_op's Save arm
+                    // owns that check). Dirtiness is not a success proxy: a
+                    // failed save of a never-modified buffer would
                     // otherwise exit silently.
-                    if !save_editor(&mut editor, volume) {
-                        return Screen::ExitPrompt { editor, choice };
+                    if save_gate(&mut editor, volume).is_none() {
+                        return Screen::ExitPrompt { editor, choice }.into();
                     }
-                    if let Some(card) = volume.as_ref() {
-                        editor.explorer.refresh(card);
-                    }
-                    return Screen::Explorer(editor.explorer);
+                    return HandleResult::Op(PendingFsOp::Save {
+                        editor,
+                        exit_after: true,
+                    });
                 }
             },
             _ => {}
         }
-        Screen::ExitPrompt { editor, choice }
+        Screen::ExitPrompt { editor, choice }.into()
     }
 
     fn move_keyboard(keyboard: &mut Keyboard, button: Button) -> bool {
@@ -2041,9 +2105,14 @@ mod firmware {
             Screen::Mounting => draw_center(frame, "SD CARD", "Mounting..."),
             Screen::Formatting => draw_center(frame, "FORMATTING", CARD_BUSY_WARNING),
             Screen::Fatal(message) => draw_center(frame, "ERROR", message),
-            Screen::FormatPrompt {
-                reason, cancelled, ..
-            } => draw_format_prompt(frame, reason, *cancelled),
+            Screen::FormatPrompt { reason, .. } => draw_format_prompt(frame, reason),
+            Screen::Unusable(reason) => {
+                draw_center(frame, "SD CARD", reason);
+                frame.render_widget(
+                    Paragraph::new("Remove the card").alignment(Alignment::Center),
+                    Rect::new(0, 10, 32, 1),
+                );
+            }
             Screen::Explorer(explorer) => draw_explorer(frame, explorer, battery_shown),
             Screen::NewMenu(menu) => draw_new_menu(frame, menu, battery_shown),
             Screen::ActionMenu(menu) => draw_action_menu(frame, menu, battery_shown),
@@ -2102,7 +2171,7 @@ mod firmware {
         );
     }
 
-    fn draw_format_prompt(frame: &mut Frame, reason: &str, cancelled: bool) {
+    fn draw_format_prompt(frame: &mut Frame, reason: &str) {
         draw_center(frame, "FORMAT SD CARD?", reason);
         frame.render_widget(
             Paragraph::new("Formatting erases ALL data")
@@ -2110,13 +2179,8 @@ mod firmware {
                 .style(Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)),
             Rect::new(0, 7, 32, 1),
         );
-        let footer = if cancelled {
-            "Cancelled     RIGHT: retry"
-        } else {
-            "LEFT: cancel  Hold RIGHT 2s"
-        };
         frame.render_widget(
-            Paragraph::new(footer).alignment(Alignment::Center),
+            Paragraph::new("LEFT: back  Hold RIGHT 2s").alignment(Alignment::Center),
             Rect::new(0, 10, 32, 1),
         );
     }
