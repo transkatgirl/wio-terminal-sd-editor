@@ -31,7 +31,6 @@ mod firmware {
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block as UiBlock, Clear, Paragraph, Wrap};
     use ratatui::{Frame, Terminal};
-    use unifat::{FsOptions, Partition, Volume};
     use wio_terminal as wio;
 
     use wio::entry;
@@ -44,12 +43,11 @@ mod firmware {
     use wio::prelude::*;
 
     use wio_terminal_sd_editor::{
-        create_directory_verified, create_empty, delete_verified, format_fat32, is_txt_file,
-        join_path, load_text, parent_path, probe_fat, read_directory_folders_page,
-        read_directory_page, rename_verified, save_failure_reason, save_transactional,
-        validate_entry_name, validate_file_stem, Button, DirectoryItem, EditError, InputEngine,
-        Key, Keyboard, MediaLayout, ProbeError, RawButtons, SdStream, TextBuffer,
-        EXPLORER_PAGE_ROWS, MAX_DOCUMENT_BYTES, MAX_ENTRY_NAME_UTF16_UNITS, MAX_FILE_STEM_CHARS,
+        format_fat32, is_txt_file, join_path, leaf_name, parent_path, probe_fat,
+        save_failure_reason, validate_entry_name, validate_file_stem, Button, CardFs,
+        DirectoryItem, EditError, FsOpError, InputEngine, Key, Keyboard, ProbeError,
+        RawButtons, SdStream, TextBuffer, EXPLORER_PAGE_ROWS, MAX_DOCUMENT_BYTES,
+        MAX_ENTRY_NAME_CHARS, MAX_FILE_STEM_CHARS,
     };
 
     const HEAP_SIZE: usize = 112 * 1024;
@@ -174,7 +172,7 @@ mod firmware {
     }
 
     impl BlockDevice for ControllerDevice {
-        type Error = embedded_sdmmc::sdcard::Error;
+        type Error = embedded_sdmmc::SdCardError;
 
         fn read(&self, blocks: &mut [Block], start: BlockIdx) -> Result<(), Self::Error> {
             let result = self.0.borrow().read(blocks, start);
@@ -212,9 +210,7 @@ mod firmware {
         }
     }
 
-    type CardStream = SdStream<ControllerDevice>;
-    type CardPartition = Partition<CardStream>;
-    type CardVolume = Volume<CardPartition>;
+    type Fs = CardFs<ControllerDevice>;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct MediaIdentity {
@@ -243,6 +239,7 @@ mod firmware {
         selected: usize,
         entries: Vec<DirectoryItem>,
         total: usize,
+        free_bytes: Option<u64>,
         status: Option<String>,
     }
 
@@ -254,12 +251,14 @@ mod firmware {
                 selected: 0,
                 entries: Vec::new(),
                 total: 0,
+                free_bytes: None,
                 status: None,
             }
         }
 
-        fn refresh(&mut self, volume: &CardVolume) {
-            match read_directory_page(volume, &self.path, self.offset, EXPLORER_PAGE_ROWS) {
+        fn refresh(&mut self, fs: &Fs) {
+            self.free_bytes = fs.free_space_bytes();
+            match fs.read_directory_page(&self.path, self.offset, EXPLORER_PAGE_ROWS) {
                 Ok((entries, total)) => {
                     self.entries = entries;
                     self.total = total;
@@ -267,7 +266,7 @@ mod firmware {
                         self.selected = 0;
                         if self.offset != 0 {
                             self.offset = self.offset.saturating_sub(EXPLORER_PAGE_ROWS);
-                            self.refresh(volume);
+                            self.refresh(fs);
                         }
                     } else {
                         self.selected = self.selected.min(self.entries.len() - 1);
@@ -282,36 +281,21 @@ mod firmware {
             }
         }
 
-        fn go_parent(&mut self, volume: &CardVolume) {
+        fn go_parent(&mut self, fs: &Fs) {
             if self.path != "/" {
                 self.path = parent_path(&self.path);
                 self.offset = 0;
                 self.selected = 0;
-                self.refresh(volume);
+                self.refresh(fs);
             }
         }
 
-        fn refresh_select_path(&mut self, volume: &CardVolume, target: &str) {
-            let mut index = None;
-            if let Ok(entries) = volume.read_dir(&self.path) {
-                for (at, result) in entries.enumerate() {
-                    let Ok(item) = result else { break };
-                    if item
-                        .path()
-                        .as_str()
-                        .replace('\\', "/")
-                        .eq_ignore_ascii_case(target)
-                    {
-                        index = Some(at);
-                        break;
-                    }
-                }
-            }
-            if let Some(index) = index {
+        fn refresh_select_path(&mut self, fs: &Fs, target: &str) {
+            if let Ok(Some(index)) = fs.entry_index(&self.path, target) {
                 self.offset = (index / EXPLORER_PAGE_ROWS) * EXPLORER_PAGE_ROWS;
                 self.selected = index - self.offset;
             }
-            self.refresh(volume);
+            self.refresh(fs);
         }
     }
 
@@ -334,14 +318,15 @@ mod firmware {
     }
 
     impl NameEntry {
-        fn can_insert(&self, ch: char) -> bool {
+        fn can_insert(&self, _ch: char) -> bool {
             match self.mode {
-                NameMode::Rename => {
-                    self.name.encode_utf16().count() + ch.len_utf16() <= MAX_ENTRY_NAME_UTF16_UNITS
+                // Folders (like renames) may carry a dot and extension; the
+                // shorter stem cap is for new .txt files alone. Character
+                // validity is enforced by validate_entry_name at DONE time.
+                NameMode::NewFolder | NameMode::Rename => {
+                    self.name.chars().count() < MAX_ENTRY_NAME_CHARS
                 }
-                NameMode::NewText | NameMode::NewFolder => {
-                    self.name.chars().count() < MAX_FILE_STEM_CHARS
-                }
+                NameMode::NewText => self.name.chars().count() < MAX_FILE_STEM_CHARS,
             }
         }
     }
@@ -426,10 +411,9 @@ mod firmware {
             }
         }
 
-        fn refresh(&mut self, volume: &CardVolume) {
+        fn refresh(&mut self, fs: &Fs) {
             let excluded = self.source.is_dir.then_some(self.source.path.as_str());
-            match read_directory_folders_page(
-                volume,
+            match fs.read_directory_folders_page(
                 &self.path,
                 self.offset,
                 EXPLORER_PAGE_ROWS,
@@ -442,7 +426,7 @@ mod firmware {
                         self.selected = 0;
                         if self.offset != 0 {
                             self.offset = self.offset.saturating_sub(EXPLORER_PAGE_ROWS);
-                            self.refresh(volume);
+                            self.refresh(fs);
                         }
                     } else {
                         self.selected = self.selected.min(self.entries.len() - 1);
@@ -457,12 +441,12 @@ mod firmware {
             }
         }
 
-        fn go_parent(&mut self, volume: &CardVolume) {
+        fn go_parent(&mut self, fs: &Fs) {
             if self.path != "/" {
                 self.path = parent_path(&self.path);
                 self.offset = 0;
                 self.selected = 0;
-                self.refresh(volume);
+                self.refresh(fs);
             }
         }
     }
@@ -534,7 +518,6 @@ mod firmware {
         Mounting,
         FormatPrompt {
             reason: &'static str,
-            cancelled: bool,
             /// RTC tick when this prompt appeared. The confirmation hold only
             /// counts presses that began at or after this moment.
             opened_at: u32,
@@ -836,13 +819,26 @@ mod firmware {
         .spi_mode(spi::MODE_0)
         .baud(400.kHz())
         .enable();
-        let sd_device = SelectedSdDevice::new(sd_bus, sd_pins.cs.into_push_pull_output()).unwrap();
+        let sd_device = match SelectedSdDevice::new(sd_bus, sd_pins.cs.into_push_pull_output()) {
+            Ok(device) => device,
+            Err(()) => {
+                // Without a working SD SPI bus there is nothing this firmware
+                // can do; halt visibly rather than panicking into panic_halt
+                // behind a frozen "Starting..." splash.
+                terminal
+                    .draw(|frame| draw_center(frame, "ERROR", "SD SPI init failed; power cycle"))
+                    .ok();
+                loop {
+                    cortex_m::asm::wfi();
+                }
+            }
+        };
         let sd_controller = Controller::new(sd_device, delay);
         let card_detect = sd_pins.det.into_pull_up_input();
         let controller = Rc::new(RefCell::new(sd_controller));
 
         let mut screen = Screen::Missing;
-        let mut volume: Option<CardVolume> = None;
+        let mut volume: Option<Fs> = None;
         let mut mounted_identity = None;
         let mut input = InputEngine::new();
         let mut last_poll = timer.count32();
@@ -891,30 +887,32 @@ mod firmware {
                 } else {
                     let previous_screen = mem::replace(&mut screen, Screen::Mounting);
                     terminal.draw(|frame| draw(frame, &screen, battery)).ok();
-                    match mount_card(&controller) {
-                        Ok((new_volume, identity)) => {
-                            screen = accept_inserted_card(previous_screen, identity);
-                            volume = Some(new_volume);
-                            mounted_identity = Some(identity);
-                            if let Screen::Explorer(explorer) = &mut screen {
-                                explorer.refresh(volume.as_ref().unwrap());
-                            }
-                        }
-                        Err(failure) => {
-                            screen = match previous_screen {
-                                Screen::Editor(mut editor) => {
-                                    editor.media = EditorMedia::Different;
-                                    Screen::Editor(editor)
-                                }
-                                Screen::ExitPrompt { mut editor, choice } => {
-                                    editor.media = EditorMedia::Different;
-                                    Screen::ExitPrompt { editor, choice }
-                                }
-                                _ => format_prompt(failure, now),
-                            };
-                        }
-                    }
+                    screen = complete_mount(
+                        previous_screen,
+                        &controller,
+                        &mut volume,
+                        &mut mounted_identity,
+                        now,
+                    );
                 }
+            }
+
+            // A dismissed Fatal screen or a discarded editor session can land
+            // on Missing while an unmountable card stayed in the slot. Card
+            // detection is edge-triggered, so retry the mount here; this
+            // cannot loop because every mount failure leaves a non-Missing
+            // screen (FormatPrompt or Fatal).
+            if volume.is_none() && last_present && matches!(screen, Screen::Missing) {
+                let previous_screen = mem::replace(&mut screen, Screen::Mounting);
+                terminal.draw(|frame| draw(frame, &screen, battery)).ok();
+                screen = complete_mount(
+                    previous_screen,
+                    &controller,
+                    &mut volume,
+                    &mut mounted_identity,
+                    now,
+                );
+                dirty = true;
             }
 
             let raw = RawButtons::default()
@@ -932,11 +930,7 @@ mod firmware {
                 dirty = true;
             }
 
-            if let Screen::FormatPrompt {
-                cancelled: false,
-                opened_at,
-                ..
-            } = &screen
+            if let Screen::FormatPrompt { opened_at, .. } = &screen
             {
                 let opened_at = *opened_at;
                 let held = input.held_ticks(Button::TopRight, now);
@@ -947,25 +941,31 @@ mod firmware {
                 if held >= FORMAT_HOLD_TICKS && now.wrapping_sub(opened_at) >= held {
                     screen = Screen::Formatting;
                     terminal.draw(|frame| draw(frame, &screen, battery)).ok();
-                    match format_card(&controller, now).and_then(|_| mount_card(&controller)) {
-                        Ok((new_volume, identity)) => {
-                            let mut explorer = Explorer::root();
-                            explorer.refresh(&new_volume);
-                            volume = Some(new_volume);
-                            mounted_identity = Some(identity);
-                            screen = Screen::Explorer(explorer);
+                    screen = match format_card(&controller, now) {
+                        Ok(()) => match mount_card(&controller) {
+                            Ok((new_volume, identity)) => {
+                                let mut explorer = Explorer::root();
+                                explorer.refresh(&new_volume);
+                                volume = Some(new_volume);
+                                mounted_identity = Some(identity);
+                                Screen::Explorer(explorer)
+                            }
+                            Err(MountFailure::Io) => {
+                                Screen::Fatal("Formatting failed: SD I/O error")
+                            }
+                            // The formatter never writes the partition types
+                            // that make mount_card report Unsupported, so any
+                            // non-I/O mount failure means the fresh format did
+                            // not read back as expected.
+                            Err(_) => Screen::Fatal("Formatting failed verification"),
+                        },
+                        Err(FormatFailure::Io) => Screen::Fatal("Formatting failed: SD I/O error"),
+                        Err(FormatFailure::TooSmall) => Screen::Fatal("Card too small for FAT32"),
+                        Err(FormatFailure::TooLarge) => Screen::Fatal("Card too large to format"),
+                        Err(FormatFailure::Failed) => {
+                            Screen::Fatal("Formatting failed verification")
                         }
-                        Err(MountFailure::Io) => {
-                            screen = Screen::Fatal("Formatting failed: SD I/O error")
-                        }
-                        // Only format_card's size guard produces Unsupported
-                        // here: the formatter never writes the partition
-                        // types that make mount_card report it.
-                        Err(MountFailure::Unsupported) => {
-                            screen = Screen::Fatal("Card too large to format")
-                        }
-                        Err(_) => screen = Screen::Fatal("Formatting failed verification"),
-                    }
+                    };
                     dirty = true;
                 }
             }
@@ -999,7 +999,7 @@ mod firmware {
 
     fn mount_card(
         controller: &Rc<RefCell<Controller>>,
-    ) -> Result<(CardVolume, MediaIdentity), MountFailure> {
+    ) -> Result<(Fs, MediaIdentity), MountFailure> {
         {
             controller
                 .borrow()
@@ -1016,47 +1016,107 @@ mod firmware {
             spi.bus_mut()
                 .reconfigure(|config| config.set_baud(400.kHz()));
         });
-        let MediaLayout {
-            start_lba,
-            sector_count,
-            volume_serial,
-        } = probe_fat(&mut stream, sectors).map_err(|error| match error {
+        let layout = probe_fat(&mut stream, sectors).map_err(|error| match error {
             ProbeError::Io(_) => MountFailure::Io,
             ProbeError::Unsupported => MountFailure::Unsupported,
             ProbeError::Invalid => MountFailure::Invalid,
         })?;
+        // A FAT volume with no partition table ("superfloppy") passes the
+        // probe but embedded-sdmmc only mounts MBR slots; treat it like any
+        // other unmountable-but-recognized layout so the user is offered the
+        // in-app format, which writes an MBR.
+        if layout.start_lba == 0 {
+            return Err(MountFailure::Unsupported);
+        }
         let identity = MediaIdentity {
             sectors,
-            partition_start: start_lba,
-            volume_serial,
+            partition_start: layout.start_lba,
+            volume_serial: layout.volume_serial,
         };
-        let partition = Partition::new(stream, start_lba, sector_count);
-        let volume = Volume::mount_with(partition, FsOptions::new().with_auto_timestamps(false))
+        drop(stream);
+        let volume = Fs::mount(ControllerDevice(controller.clone()), layout)
             .map_err(|error| match error {
-                unifat::FsError::Io(_) => MountFailure::Io,
-                unifat::FsError::Unsupported => MountFailure::Unsupported,
+                embedded_sdmmc::Error::DeviceError(_) => MountFailure::Io,
+                embedded_sdmmc::Error::Unsupported => MountFailure::Unsupported,
                 _ => MountFailure::Invalid,
             })?;
         Ok((volume, identity))
     }
 
+    /// Mounts a freshly available card and derives the next screen from the
+    /// one that was showing. The caller has already switched the display to
+    /// `Screen::Mounting`.
+    fn complete_mount(
+        previous: Screen,
+        controller: &Rc<RefCell<Controller>>,
+        volume: &mut Option<Fs>,
+        mounted_identity: &mut Option<MediaIdentity>,
+        now: u32,
+    ) -> Screen {
+        match mount_card(controller) {
+            Ok((new_volume, identity)) => {
+                let mut screen = accept_inserted_card(previous, identity);
+                if let Screen::Explorer(explorer) = &mut screen {
+                    explorer.refresh(&new_volume);
+                }
+                *volume = Some(new_volume);
+                *mounted_identity = Some(identity);
+                screen
+            }
+            Err(failure) => {
+                let mark = |editor: &mut Editor| {
+                    if failure == MountFailure::Io {
+                        // The card in the slot may still be the original; only
+                        // its probe failed. Keep save gated on a clean
+                        // identity-matching mount instead of asserting the
+                        // card is different.
+                        editor.media = EditorMedia::Removed;
+                        editor.status = Some("SD read failed; remove and reinsert".into());
+                    } else {
+                        editor.media = EditorMedia::Different;
+                    }
+                };
+                match previous {
+                    Screen::Editor(mut editor) => {
+                        mark(&mut editor);
+                        Screen::Editor(editor)
+                    }
+                    Screen::ExitPrompt { mut editor, choice } => {
+                        mark(&mut editor);
+                        Screen::ExitPrompt { editor, choice }
+                    }
+                    _ => format_prompt(failure, now),
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FormatFailure {
+        Io,
+        TooSmall,
+        TooLarge,
+        Failed,
+    }
+
     /// `seed` perturbs the new volume serial. The caller passes the RTC tick
     /// at the moment the user confirmed the format: uptime plus human timing
     /// is the only entropy available on a device without a calendar clock.
-    fn format_card(controller: &Rc<RefCell<Controller>>, seed: u32) -> Result<(), MountFailure> {
+    fn format_card(controller: &Rc<RefCell<Controller>>, seed: u32) -> Result<(), FormatFailure> {
         let device = ControllerDevice(controller.clone());
-        let mut stream = SdStream::new(device).map_err(|_| MountFailure::Io)?;
+        let mut stream = SdStream::new(device).map_err(|_| FormatFailure::Io)?;
         let total_sectors = stream.len() / 512;
         // MBR LBA fields and the backup-GPT erase cannot address sectors
         // past 2 TiB; refuse rather than write a wrong geometry or leave a
         // stale backup GPT header at the true last LBA.
         if total_sectors > u64::from(u32::MAX) {
-            return Err(MountFailure::Unsupported);
+            return Err(FormatFailure::TooLarge);
         }
         let sectors = total_sectors as u32;
         format_fat32(&mut stream, sectors, seed).map_err(|error| match error {
-            wio_terminal_sd_editor::FormatError::Io(_) => MountFailure::Io,
-            _ => MountFailure::Invalid,
+            wio_terminal_sd_editor::FormatError::Io(_) => FormatFailure::Io,
+            wio_terminal_sd_editor::FormatError::TooSmall => FormatFailure::TooSmall,
+            _ => FormatFailure::Failed,
         })?;
         Ok(())
     }
@@ -1071,7 +1131,6 @@ mod firmware {
                 MountFailure::Invalid => "Invalid or damaged filesystem",
                 MountFailure::Io => unreachable!(),
             },
-            cancelled: false,
             opened_at: now,
         }
     }
@@ -1121,7 +1180,7 @@ mod firmware {
     fn handle_button(
         screen: Screen,
         button: Button,
-        volume: &mut Option<CardVolume>,
+        volume: &mut Option<Fs>,
         identity: Option<MediaIdentity>,
     ) -> Screen {
         match screen {
@@ -1137,24 +1196,6 @@ mod firmware {
             } => handle_delete_prompt(explorer, item, choice, button, volume),
             Screen::Editor(editor) => handle_editor(editor, button, volume),
             Screen::ExitPrompt { editor, choice } => handle_exit(editor, choice, button, volume),
-            Screen::FormatPrompt {
-                reason, opened_at, ..
-            } if button == Button::TopLeft => Screen::FormatPrompt {
-                reason,
-                cancelled: true,
-                opened_at,
-            },
-            // A retry needs no fresh opened_at: it fires on a new press event,
-            // so that press necessarily began after the prompt opened.
-            Screen::FormatPrompt {
-                reason,
-                cancelled: true,
-                opened_at,
-            } if button == Button::TopRight => Screen::FormatPrompt {
-                reason,
-                cancelled: false,
-                opened_at,
-            },
             Screen::Fatal(_) if button == Button::TopRight => Screen::Missing,
             other => other,
         }
@@ -1163,7 +1204,7 @@ mod firmware {
     fn handle_explorer(
         mut explorer: Explorer,
         button: Button,
-        volume: &mut Option<CardVolume>,
+        volume: &mut Option<Fs>,
         identity: Option<MediaIdentity>,
     ) -> Screen {
         let Some(card) = volume.as_ref() else {
@@ -1214,7 +1255,7 @@ mod firmware {
                 } else if !is_txt_file(&item.name) {
                     explorer.status = Some("Only .txt files can be edited".into());
                 } else {
-                    match load_text(card, &item.path) {
+                    match card.load_text(&item.path) {
                         Ok(buffer) => {
                             return Screen::Editor(Editor {
                                 explorer,
@@ -1270,11 +1311,7 @@ mod firmware {
         }
     }
 
-    fn handle_action_menu(
-        mut menu: ActionMenu,
-        button: Button,
-        volume: &mut Option<CardVolume>,
-    ) -> Screen {
+    fn handle_action_menu(mut menu: ActionMenu, button: Button, volume: &mut Option<Fs>) -> Screen {
         match button {
             Button::TopLeft => return Screen::Explorer(menu.explorer),
             Button::Up | Button::Left => menu.choice = menu.choice.previous(),
@@ -1291,7 +1328,10 @@ mod firmware {
                         menu.explorer.status = Some("No item selected".into());
                         return Screen::Explorer(menu.explorer);
                     };
-                    let name = item.name.clone();
+                    // Prefill with the stored 8.3 name (the last path
+                    // component), not the display name: a long display name
+                    // would fail 8.3 validation before the user typed a key.
+                    let name = String::from(leaf_name(&item.path));
                     return Screen::Naming(NameEntry {
                         explorer: menu.explorer,
                         mode: NameMode::Rename,
@@ -1333,7 +1373,7 @@ mod firmware {
     fn handle_name_entry(
         mut entry: NameEntry,
         button: Button,
-        volume: &mut Option<CardVolume>,
+        volume: &mut Option<Fs>,
         identity: Option<MediaIdentity>,
     ) -> Screen {
         if button == Button::TopLeft {
@@ -1359,7 +1399,7 @@ mod firmware {
                 NameMode::NewText => {
                     let name = format!("{}.txt", entry.name);
                     let path = join_path(&entry.explorer.path, &name);
-                    match create_empty(card, &path) {
+                    match card.create_empty(&path) {
                         Ok(()) => {
                             return Screen::Editor(Editor {
                                 explorer: entry.explorer,
@@ -1375,7 +1415,7 @@ mod firmware {
                                 identity: identity.expect("mounted name entry has identity"),
                             });
                         }
-                        Err(unifat::FsError::AlreadyExists) => {
+                        Err(FsOpError::AlreadyExists) => {
                             entry.status = Some("That file already exists".into())
                         }
                         Err(error) => {
@@ -1386,13 +1426,13 @@ mod firmware {
                 }
                 NameMode::NewFolder => {
                     let path = join_path(&entry.explorer.path, &entry.name);
-                    match create_directory_verified(card, &path) {
+                    match card.create_directory_verified(&path) {
                         Ok(()) => {
                             entry.explorer.refresh_select_path(card, &path);
                             entry.explorer.status = Some("Folder created".into());
                             return Screen::Explorer(entry.explorer);
                         }
-                        Err(unifat::FsError::AlreadyExists) => {
+                        Err(FsOpError::AlreadyExists) => {
                             entry.status = Some("That name already exists".into())
                         }
                         Err(error) => {
@@ -1404,13 +1444,13 @@ mod firmware {
                 NameMode::Rename => {
                     let source = entry.source.as_ref().expect("rename has a source");
                     let path = join_path(&entry.explorer.path, &entry.name);
-                    match rename_verified(card, &source.path, &path) {
+                    match card.move_entry_verified(&source.path, &path) {
                         Ok(()) => {
                             entry.explorer.refresh_select_path(card, &path);
                             entry.explorer.status = Some("Renamed".into());
                             return Screen::Explorer(entry.explorer);
                         }
-                        Err(unifat::FsError::AlreadyExists) => {
+                        Err(FsOpError::AlreadyExists) => {
                             entry.status = Some("That name already exists".into())
                         }
                         Err(error) => {
@@ -1446,13 +1486,16 @@ mod firmware {
                 Key::Space if entry.can_insert(' ') => {
                     entry.name.insert(entry.cursor, ' ');
                     entry.cursor += 1;
+                    entry.status = None;
                 }
                 Key::Backspace if entry.cursor > 0 => {
                     entry.cursor = previous_char_boundary(&entry.name, entry.cursor);
                     entry.name.remove(entry.cursor);
+                    entry.status = None;
                 }
                 Key::Delete if entry.cursor < entry.name.len() => {
                     entry.name.remove(entry.cursor);
+                    entry.status = None;
                 }
                 Key::Enter => entry.status = Some("Use DONE to finish the name".into()),
                 Key::Case | Key::Page => entry.keyboard.activate_meta(key),
@@ -1465,7 +1508,7 @@ mod firmware {
     fn handle_move_picker(
         mut picker: MovePicker,
         button: Button,
-        volume: &mut Option<CardVolume>,
+        volume: &mut Option<Fs>,
     ) -> Screen {
         let Some(card) = volume.as_ref() else {
             return Screen::Missing;
@@ -1505,8 +1548,11 @@ mod firmware {
                     picker.status = Some("Item is already in this folder".into());
                     return Screen::MovePicker(picker);
                 }
-                let destination = join_path(&picker.path, &picker.source.name);
-                match rename_verified(card, &picker.source.path, &destination) {
+                // The destination keeps the entry's stored 8.3 name (the last
+                // path component), not the display name: a long display name
+                // cannot be created on the destination side.
+                let destination = join_path(&picker.path, leaf_name(&picker.source.path));
+                match card.move_entry_verified(&picker.source.path, &destination) {
                     Ok(()) => {
                         let mut explorer = Explorer {
                             path: picker.path,
@@ -1514,13 +1560,14 @@ mod firmware {
                             selected: 0,
                             entries: Vec::new(),
                             total: 0,
+                            free_bytes: None,
                             status: None,
                         };
                         explorer.refresh_select_path(card, &destination);
                         explorer.status = Some("Moved".into());
                         return Screen::Explorer(explorer);
                     }
-                    Err(unifat::FsError::AlreadyExists) => {
+                    Err(FsOpError::AlreadyExists) => {
                         picker.status = Some("That name already exists here".into())
                     }
                     Err(error) => {
@@ -1538,7 +1585,7 @@ mod firmware {
         item: DirectoryItem,
         mut choice: DeleteChoice,
         button: Button,
-        volume: &mut Option<CardVolume>,
+        volume: &mut Option<Fs>,
     ) -> Screen {
         match button {
             Button::Left | Button::Right | Button::Up | Button::Down => {
@@ -1554,7 +1601,7 @@ mod firmware {
                     let Some(card) = volume.as_ref() else {
                         return Screen::Missing;
                     };
-                    match delete_verified(card, &item.path, item.is_dir) {
+                    match card.delete_verified(&item.path, item.is_dir) {
                         Ok(()) => {
                             explorer.refresh(card);
                             explorer.status = Some(if item.is_dir {
@@ -1583,11 +1630,7 @@ mod firmware {
         }
     }
 
-    fn handle_editor(
-        mut editor: Editor,
-        button: Button,
-        volume: &mut Option<CardVolume>,
-    ) -> Screen {
+    fn handle_editor(mut editor: Editor, button: Button, volume: &mut Option<Fs>) -> Screen {
         match button {
             Button::TopLeft => {
                 // The dialog repeats editor.status as save feedback, so a
@@ -1640,7 +1683,7 @@ mod firmware {
     }
 
     /// Returns whether the document verifiably reached the card.
-    fn save_editor(editor: &mut Editor, volume: &mut Option<CardVolume>) -> bool {
+    fn save_editor(editor: &mut Editor, volume: &mut Option<Fs>) -> bool {
         if editor.media != EditorMedia::Ready {
             editor.status = Some(
                 match editor.media {
@@ -1656,7 +1699,7 @@ mod firmware {
             editor.status = Some("SD card is unavailable".into());
             return false;
         };
-        match save_transactional(card, &editor.path, editor.buffer.bytes()) {
+        match card.save_transactional(&editor.path, editor.buffer.bytes()) {
             Ok(()) => {
                 editor.buffer.mark_clean();
                 editor.status = Some("Saved".into());
@@ -1673,7 +1716,7 @@ mod firmware {
         mut editor: Editor,
         mut choice: ExitChoice,
         button: Button,
-        volume: &mut Option<CardVolume>,
+        volume: &mut Option<Fs>,
     ) -> Screen {
         match button {
             Button::Left | Button::Up => choice = choice.left(),
@@ -1737,9 +1780,7 @@ mod firmware {
             Screen::Mounting => draw_center(frame, "SD CARD", "Mounting..."),
             Screen::Formatting => draw_center(frame, "FORMATTING", "Do not remove the card"),
             Screen::Fatal(message) => draw_center(frame, "ERROR", message),
-            Screen::FormatPrompt {
-                reason, cancelled, ..
-            } => draw_format_prompt(frame, reason, *cancelled),
+            Screen::FormatPrompt { reason, .. } => draw_format_prompt(frame, reason),
             Screen::Explorer(explorer) => draw_explorer(frame, explorer, battery_shown),
             Screen::NewMenu(menu) => draw_new_menu(frame, menu, battery_shown),
             Screen::ActionMenu(menu) => draw_action_menu(frame, menu, battery_shown),
@@ -1792,7 +1833,7 @@ mod firmware {
         );
     }
 
-    fn draw_format_prompt(frame: &mut Frame, reason: &str, cancelled: bool) {
+    fn draw_format_prompt(frame: &mut Frame, reason: &str) {
         draw_center(frame, "FORMAT SD CARD?", reason);
         frame.render_widget(
             Paragraph::new("Formatting erases ALL data")
@@ -1800,13 +1841,8 @@ mod firmware {
                 .style(Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)),
             Rect::new(0, 7, 32, 1),
         );
-        let footer = if cancelled {
-            "Cancelled     RIGHT: retry"
-        } else {
-            "LEFT: cancel  Hold RIGHT 2s"
-        };
         frame.render_widget(
-            Paragraph::new(footer).alignment(Alignment::Center),
+            Paragraph::new("Hold TOP RIGHT 2s").alignment(Alignment::Center),
             Rect::new(0, 10, 32, 1),
         );
     }
@@ -1850,6 +1886,13 @@ mod firmware {
                 Rect::new(0, 10, 32, 1),
             );
         } else {
+            if let Some(free) = explorer.free_bytes {
+                frame.render_widget(
+                    Paragraph::new(format!("{} free", compact_size(free)))
+                        .style(Style::new().fg(Color::DarkGray)),
+                    Rect::new(0, 10, 16, 1),
+                );
+            }
             let position = if explorer.total == 0 {
                 "0/0".into()
             } else {
@@ -1861,7 +1904,9 @@ mod firmware {
             };
             frame.render_widget(
                 Paragraph::new(position).alignment(Alignment::Right),
-                Rect::new(24, 10, 8, 1),
+                // 16 cells: wide enough that even "99999/99999" renders
+                // without clipping digits.
+                Rect::new(16, 10, 16, 1),
             );
         }
         footer(frame, "UP", "NEW", "ACTIONS");
@@ -2238,8 +2283,13 @@ mod firmware {
             format!("{bytes}B")
         } else if bytes < 1_000_000 {
             format!("{}K", bytes / 1_000)
-        } else {
+        } else if bytes < 1_000_000_000 {
             format!("{}M", bytes / 1_000_000)
+        } else {
+            // One decimal keeps small gigabyte figures honest ("1.9G", not
+            // "1G"); free space is the only value that reaches this range.
+            let tenths = bytes / 100_000_000;
+            format!("{}.{}G", tenths / 10, tenths % 10)
         }
     }
 }
