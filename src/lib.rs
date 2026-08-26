@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cell::Cell;
@@ -579,14 +580,23 @@ pub fn validate_entry_name(name: &str) -> Result<(), &'static str> {
     if name.ends_with('.') {
         return Err("Name cannot end with a dot");
     }
-    match ShortFileName::create_from_str(name) {
-        Ok(_) => Ok(()),
-        Err(FilenameError::FilenameEmpty) => Err("Enter a name"),
+    let sfn = match ShortFileName::create_from_str(name) {
+        Ok(sfn) => sfn,
+        Err(FilenameError::FilenameEmpty) => return Err("Enter a name"),
         Err(FilenameError::NameTooLong | FilenameError::MisplacedPeriod) => {
-            Err("Use an 8.3 name like NOTES.TXT")
+            return Err("Use an 8.3 name like NOTES.TXT")
         }
-        Err(_) => Err("Name contains a FAT-reserved character"),
+        Err(_) => return Err("Name contains a FAT-reserved character"),
+    };
+    // create_from_str normalizes some inputs silently (repeated interior
+    // dots: "A..TXT" is stored as "A.TXT"), so the stored name would differ
+    // from the typed one and selection tracking would miss the entry. Round-
+    // trip the parsed name; case aside (8.3 names store uppercase), anything
+    // it does not reproduce is refused.
+    if !sfn.to_string().eq_ignore_ascii_case(name) {
+        return Err("Name would be stored differently");
     }
+    Ok(())
 }
 
 pub fn is_txt_file(name: &str) -> bool {
@@ -682,6 +692,37 @@ impl<D: BlockDevice> ErrorType for SdStream<D> {
     type Error = SdStreamError;
 }
 
+/// How many times a raw SD exchange is attempted before its failure is
+/// surfaced. Single SPI commands flake on real cards, so the retry policy
+/// lives in the `BlockDevice` implementation (the firmware's controller
+/// device, which recovers the card between attempts): every raw exchange
+/// gets this many chances exactly once. The library issues each device call
+/// once and does not add its own retry layer (`delete_entry_checked`'s
+/// cache-aware retries run under their own independent budget,
+/// `DELETE_RETRY_ATTEMPTS`).
+pub const SD_RETRY_ATTEMPTS: usize = 3;
+
+/// The manager-level budget for `delete_entry_checked`'s cache-aware
+/// retries. Deliberately a separate knob from [`SD_RETRY_ATTEMPTS`]: the
+/// two policies serve different purposes (cache-echo disambiguation vs
+/// transient-flake absorption), and each delete attempt already passes
+/// through the device layer's full retry cycle, so tuning one must not
+/// silently multiply the other.
+const DELETE_RETRY_ATTEMPTS: usize = 3;
+
+/// Run `operation` up to [`SD_RETRY_ATTEMPTS`] times, returning the first
+/// success or the last attempt's error.
+pub fn sd_retry<T, E>(mut operation: impl FnMut() -> Result<T, E>) -> Result<T, E> {
+    let mut result = operation();
+    for _ in 1..SD_RETRY_ATTEMPTS {
+        if result.is_ok() {
+            break;
+        }
+        result = operation();
+    }
+    result
+}
+
 impl<D: BlockDevice> Read for SdStream<D> {
     fn read(&mut self, output: &mut [u8]) -> Result<usize, Self::Error> {
         let available = self.length.saturating_sub(self.position);
@@ -694,27 +735,17 @@ impl<D: BlockDevice> Read for SdStream<D> {
             let sector_offset = (self.position % 512) as usize;
             let count = (wanted - done).min(512 - sector_offset);
             let mut block = Block::new();
-            let mut failure = None;
-            for _ in 0..3 {
-                match self
-                    .device
-                    .read(core::slice::from_mut(&mut block), BlockIdx(sector_index))
-                {
-                    Ok(()) => {
-                        failure = None;
-                        break;
-                    }
-                    Err(error) => failure = Some(alloc::format!("{error:?}")),
-                }
-            }
-            if let Some(detail) = failure {
+            if let Err(error) = self
+                .device
+                .read(core::slice::from_mut(&mut block), BlockIdx(sector_index))
+            {
                 // Report the sectors already delivered; the next call starts
                 // at the failing sector and surfaces the error with zero
                 // progress, so Err never hides consumed bytes.
                 return if done > 0 {
                     Ok(done)
                 } else {
-                    Err(SdStreamError::DeviceRead(detail))
+                    Err(SdStreamError::DeviceRead(alloc::format!("{error:?}")))
                 };
             }
             output[done..done + count]
@@ -744,50 +775,30 @@ impl<D: BlockDevice> Write for SdStream<D> {
             let count = (wanted - done).min(512 - sector_offset);
             let mut block = Block::new();
             if sector_offset != 0 || count != 512 {
-                let mut failure = None;
-                for _ in 0..3 {
-                    match self
-                        .device
-                        .read(core::slice::from_mut(&mut block), BlockIdx(sector_index))
-                    {
-                        Ok(()) => {
-                            failure = None;
-                            break;
-                        }
-                        Err(error) => failure = Some(alloc::format!("{error:?}")),
-                    }
-                }
-                if let Some(detail) = failure {
+                if let Err(error) = self
+                    .device
+                    .read(core::slice::from_mut(&mut block), BlockIdx(sector_index))
+                {
                     // As in read(): acknowledge the sectors already written
                     // so an Err always means nothing from this call reached
                     // the card.
                     return if done > 0 {
                         Ok(done)
                     } else {
-                        Err(SdStreamError::DeviceRead(detail))
+                        Err(SdStreamError::DeviceRead(alloc::format!("{error:?}")))
                     };
                 }
             }
             block.contents[sector_offset..sector_offset + count]
                 .copy_from_slice(&input[done..done + count]);
-            let mut failure = None;
-            for _ in 0..3 {
-                match self
-                    .device
-                    .write(core::slice::from_ref(&block), BlockIdx(sector_index))
-                {
-                    Ok(()) => {
-                        failure = None;
-                        break;
-                    }
-                    Err(error) => failure = Some(alloc::format!("{error:?}")),
-                }
-            }
-            if let Some(detail) = failure {
+            if let Err(error) = self
+                .device
+                .write(core::slice::from_ref(&block), BlockIdx(sector_index))
+            {
                 return if done > 0 {
                     Ok(done)
                 } else {
-                    Err(SdStreamError::DeviceWrite(detail))
+                    Err(SdStreamError::DeviceWrite(alloc::format!("{error:?}")))
                 };
             }
             self.position += count as u64;
@@ -837,6 +848,22 @@ pub enum ProbeError<E> {
     Invalid,
 }
 
+/// MBR status bits other than 0x80 (bootable) mark a slot embedded-sdmmc's
+/// mount refuses; its `open_raw_volume` masks with 0x7F the same way. The
+/// crate's check is private, so parity is proven by a host test instead of
+/// a shared constant.
+const MBR_STATUS_INVALID_MASK: u8 = 0x7f;
+
+/// Partition types embedded-sdmmc 0.10 mounts (its `PARTITION_ID_*`
+/// constants are private): FAT16-small, FAT16, FAT16-LBA, FAT32-CHS-LBA,
+/// FAT32-LBA. Parity with the mount layer is proven by a host test.
+const MOUNTABLE_PARTITION_TYPES: [u8; 5] = [0x04, 0x06, 0x0b, 0x0c, 0x0e];
+
+/// Recognized-but-unmountable types (FAT12, extended, NTFS/exFAT,
+/// extended-LBA, GPT protective): probe-side classification only, so a card
+/// carrying one reads "unsupported" rather than "damaged".
+const KNOWN_UNSUPPORTED_PARTITION_TYPES: [u8; 5] = [0x01, 0x05, 0x07, 0x0f, 0xee];
+
 pub fn probe_fat<S: Read + Seek>(
     storage: &mut S,
     media_sectors: u32,
@@ -876,17 +903,17 @@ pub fn probe_fat<S: Read + Seek>(
         // 0x80 (bootable) set, so accepting one here would probe a partition
         // the mount can never open and dead-end a good card at the format
         // prompt instead of trying the remaining slots.
-        if sector[base] & 0x7f != 0 {
+        if sector[base] & MBR_STATUS_INVALID_MASK != 0 {
             continue;
         }
         let kind = sector[base + 4];
         let start = le_u32(&sector[base + 8..base + 12]);
         let count = le_u32(&sector[base + 12..base + 16]);
-        if matches!(kind, 0x01 | 0x07 | 0xee | 0x05 | 0x0f) {
+        if KNOWN_UNSUPPORTED_PARTITION_TYPES.contains(&kind) {
             saw_unsupported = true;
             continue;
         }
-        if !matches!(kind, 0x04 | 0x06 | 0x0e | 0x0b | 0x0c) || count == 0 {
+        if !MOUNTABLE_PARTITION_TYPES.contains(&kind) || count == 0 {
             continue;
         }
         // A damaged or bogus entry disqualifies only itself: a later entry
@@ -937,6 +964,7 @@ struct VolumeGeometry {
     total_sectors: u32,
     reserved_sectors: u32,
     fat_sectors: u32,
+    fat_copies: u8,
     sectors_per_cluster: u8,
     cluster_count: u32,
     /// FSInfo sector number from the FAT32 EBPB; meaningless on FAT16.
@@ -1020,6 +1048,7 @@ fn parse_fat_boot_sector(sector: &[u8; 512]) -> BootSector {
                 total_sectors: total,
                 reserved_sectors: reserved,
                 fat_sectors: fat_size,
+                fat_copies: fats as u8,
                 sectors_per_cluster,
                 cluster_count: clusters,
                 fsinfo_sector: u16::from_le_bytes([sector[48], sector[49]]),
@@ -1032,6 +1061,7 @@ fn parse_fat_boot_sector(sector: &[u8; 512]) -> BootSector {
             total_sectors: total,
             reserved_sectors: reserved,
             fat_sectors: fat_size,
+            fat_copies: fats as u8,
             sectors_per_cluster,
             cluster_count: clusters,
             fsinfo_sector: 0,
@@ -1180,6 +1210,7 @@ pub fn format_fat32<S: Read + Write + Seek>(
     write_sector(storage, geometry.partition_start + 7, &info).map_err(FormatError::Io)?;
 
     let first_fat = geometry.partition_start + 32;
+    let phantom_offset = ((geometry.cluster_count + 2) as usize * 4) % 512;
     for copy in 0..2 {
         let base = first_fat + copy * geometry.fat_sectors;
         for offset in 0..geometry.fat_sectors {
@@ -1190,6 +1221,21 @@ pub fn format_fat32<S: Read + Write + Seek>(
         put_u32(&mut first[4..8], 0xffff_ffff);
         put_u32(&mut first[8..12], 0x0fff_ffff);
         write_sector(storage, base, &first).map_err(FormatError::Io)?;
+        // The FAT's last sector has spare entries beyond the volume's real
+        // clusters. The manager's free-cluster search scans whole FAT
+        // sectors without re-checking its end bound, so zeroed spares
+        // would be handed out as allocatable clusters that map past the
+        // end of the partition; mark them bad, as a real formatter does.
+        // FAT32's 65,525-cluster minimum keeps fat_sectors >= 512, so this
+        // is never the sector holding entries 0..2 above.
+        if phantom_offset != 0 {
+            let mut last = [0u8; 512];
+            for entry in last[phantom_offset..].as_chunks_mut::<4>().0 {
+                put_u32(entry, 0x0fff_fff7);
+            }
+            write_sector(storage, base + geometry.fat_sectors - 1, &last)
+                .map_err(FormatError::Io)?;
+        }
     }
 
     let root = first_fat + 2 * geometry.fat_sectors;
@@ -1320,6 +1366,52 @@ pub enum FsOpError<E: core::error::Error> {
     TooLarge,
     /// A subtree operation met nesting deeper than [`MAX_TREE_DEPTH`].
     TooDeep,
+    /// A DiskFull report from the manager while the card no longer answers
+    /// even a probe read. The manager masks device faults met while
+    /// extending a file's cluster chain as DiskFull; reporting that as a
+    /// full card would invite the user to delete files on a dead card.
+    DeviceUnresponsive,
+    /// A delete failed after destruction already persisted: a file's
+    /// contents reclaimed (cluster chain freed, size zeroed by the
+    /// pre-delete reclaim, leaving the entry listed but empty) or some of a
+    /// folder's children removed before the failure. Distinct from `Fs` so
+    /// callers can report the true state instead of implying the data is
+    /// intact -- after a verified move this means "data safe at the
+    /// destination, source left as an empty ghost". Wraps the underlying
+    /// failure.
+    DeleteIncomplete(Box<FsOpError<E>>),
+    /// A copy/move failed AND removing the partial destination failed too:
+    /// a partial (possibly zero-byte) ghost bearing the destination name
+    /// remains, and a retry will stop at "already exists" until it is
+    /// deleted. Wraps the original failure.
+    CleanupIncomplete(Box<FsOpError<E>>),
+    /// A move's copy fully verified at the destination, but removing the
+    /// source failed with its contents (possibly) intact -- the
+    /// no-destruction counterpart of `DeleteIncomplete`. Success with a
+    /// caveat: the destination is the
+    /// operation of record and must never be rolled back (it may hold the
+    /// only good copy); the stale source entry remains and a retried move
+    /// will stop at "already exists" until it is removed. Wraps the
+    /// delete's failure.
+    SourceRemains(Box<FsOpError<E>>),
+}
+
+/// A failed transactional save, plus whether a staging backup provably
+/// survived: `backup_kept` names the on-card `~WIO*.BAK` (full path) that
+/// still holds the original contents when the target may not.
+#[derive(Debug)]
+pub struct SaveError<E: core::error::Error> {
+    pub error: FsOpError<E>,
+    pub backup_kept: Option<String>,
+}
+
+impl<E: core::error::Error> From<FsOpError<E>> for SaveError<E> {
+    fn from(error: FsOpError<E>) -> Self {
+        Self {
+            error,
+            backup_kept: None,
+        }
+    }
 }
 
 impl<E: core::error::Error> From<embedded_sdmmc::Error<E>> for FsOpError<E> {
@@ -1334,8 +1426,11 @@ impl<E: core::error::Error> From<embedded_sdmmc::Error<E>> for FsOpError<E> {
 }
 
 impl<E: core::error::Error> FsOpError<E> {
-    /// After a device I/O error the filesystem's metadata cache no longer
-    /// proves what reached the card; callers stop mutating when this is true.
+    /// Whether this is a proven device I/O fault, after which the
+    /// filesystem's metadata cache no longer proves what reached the card.
+    /// Production code gates rollback via `assess_failure` (which also
+    /// covers the manager's masked forms); this narrower check remains for
+    /// the host tests' assertions.
     pub fn is_device_error(&self) -> bool {
         matches!(self, Self::Fs(embedded_sdmmc::Error::DeviceError(_)))
     }
@@ -1390,14 +1485,40 @@ pub struct CardFs<D: BlockDevice> {
     /// Cached [`Self::free_space_bytes`] result, so browsing never re-reads
     /// the card for a figure that cannot have changed.
     free_space: Cell<Option<u64>>,
-    /// Set by every mutating operation: the cached figure (and, on FAT32,
-    /// the on-disk FSInfo sector) may no longer match the FAT.
-    free_space_stale: Cell<bool>,
+    /// Where the cached figure (and, on FAT32, the on-disk FSInfo sector
+    /// and the volume handle behind it) stands; see [`FreeSpaceState`].
+    free_space_state: Cell<FreeSpaceState>,
+}
+
+/// Lifecycle of the free-space cache and the FAT32 metadata flush that
+/// feeds it. One state cell instead of coupled flags, so the invalid
+/// combinations are unrepresentable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FreeSpaceState {
+    /// The cached figure (if any) still matches the card.
+    Clean,
+    /// A mutation ran: the figure (and, on FAT32, the on-disk FSInfo
+    /// sector) may no longer match the FAT; re-flush before measuring.
+    Stale,
+    /// The FAT32 metadata flush failed with the mounted volume intact
+    /// (the close was refused). Latched so a hung-but-seated card does
+    /// not pay the close/reopen cycle on every explorer refresh; cleared
+    /// by the next mutation, which proves someone reached the card again.
+    FlushFailed,
+    /// `close_volume` deregistered the volume but the reopen failed: the
+    /// stored [`RawVolume`] handle is dead and every operation reports a
+    /// bad handle until it is repaired. Each free-space query retries
+    /// only the reopen (cheap on a recovered card), so browsing
+    /// self-heals without waiting for a mutation or a card reseat.
+    VolumeDead,
 }
 
 impl<D: BlockDevice> CardFs<D> {
     /// Mount the FAT volume described by `layout` (from [`probe_fat`]).
     pub fn mount(device: D, layout: MediaLayout) -> Result<Self, embedded_sdmmc::Error<D::Error>> {
+        if layout.fat32 {
+            repair_phantom_fat_tail(&device, &layout);
+        }
         let mgr = VolumeManager::new(device, FixedTimeSource);
         let volume = mgr.open_raw_volume(VolumeIdx(usize::from(layout.partition_index)))?;
         Ok(Self {
@@ -1405,8 +1526,23 @@ impl<D: BlockDevice> CardFs<D> {
             volume: Cell::new(volume),
             layout,
             free_space: Cell::new(None),
-            free_space_stale: Cell::new(false),
+            free_space_state: Cell::new(FreeSpaceState::Clean),
         })
+    }
+
+    /// Every mutating operation calls this: the cached free-space figure
+    /// (and, on FAT32, the on-disk FSInfo sector) may no longer match the
+    /// FAT. It also re-arms a failed metadata flush -- the mutation proves
+    /// someone is talking to the card again, so the next free-space query
+    /// may retry the volume cycle once, instead of every explorer refresh
+    /// repeating a multi-second reopen ordeal on a hung card. A dead
+    /// volume handle is the exception: a mutation cannot repair it (it
+    /// fails on the bad handle itself), so the state must keep demanding
+    /// the reopen retry instead of being downgraded to plain staleness.
+    fn mark_free_space_stale(&self) {
+        if self.free_space_state.get() != FreeSpaceState::VolumeDead {
+            self.free_space_state.set(FreeSpaceState::Stale);
+        }
     }
 
     /// Bytes still free on the volume, or `None` when the figure cannot be
@@ -1414,7 +1550,12 @@ impl<D: BlockDevice> CardFs<D> {
     /// count (a card formatted elsewhere may carry none); FAT16 has no
     /// FSInfo sector, but its FAT is at most 128 KiB, so the free entries
     /// are counted directly. Errors are absorbed into `None`: the figure is
-    /// advisory and the next query retries.
+    /// advisory. A failed FAT32 metadata flush latches (see
+    /// [`FreeSpaceState`]): with the volume intact, later queries keep
+    /// answering `None` without touching the card until the next mutation;
+    /// with the volume handle dead, each query retries only the reopen so
+    /// browsing self-heals as soon as the card answers again. Other misses
+    /// simply retry on the next query.
     ///
     /// The FAT32 figure can run low: the manager's truncate frees a chain's
     /// final cluster in the FAT without counting it, so every overwrite or
@@ -1422,11 +1563,30 @@ impl<D: BlockDevice> CardFs<D> {
     /// The drift is conservative (space is never overstated) and a PC disk
     /// check rebuilds the FSInfo count from the FAT.
     pub fn free_space_bytes(&self) -> Option<u64> {
-        if self.free_space_stale.get() {
-            if self.layout.fat32 && !self.flush_volume_metadata() {
-                return None;
+        match self.free_space_state.get() {
+            // A previous flush already failed with the volume intact and
+            // nothing has touched the card since; retrying now would just
+            // freeze the UI again.
+            FreeSpaceState::FlushFailed => return None,
+            FreeSpaceState::VolumeDead => {
+                if self.reopen_volume().is_err() {
+                    return None;
+                }
+                // The interrupted flush may have left the on-disk FSInfo
+                // sector stale; fall through to the stale path to re-flush
+                // and re-measure.
+                self.free_space_state.set(FreeSpaceState::Stale);
             }
-            self.free_space_stale.set(false);
+            FreeSpaceState::Clean | FreeSpaceState::Stale => {}
+        }
+        if self.free_space_state.get() == FreeSpaceState::Stale {
+            if self.layout.fat32 {
+                if let Err(state) = self.flush_volume_metadata() {
+                    self.free_space_state.set(state);
+                    return None;
+                }
+            }
+            self.free_space_state.set(FreeSpaceState::Clean);
             self.free_space.set(None);
         }
         if let Some(bytes) = self.free_space.get() {
@@ -1443,32 +1603,75 @@ impl<D: BlockDevice> CardFs<D> {
     /// never dirties a file, so it leaves the on-disk copy behind. Cycling
     /// the volume forces that write so [`Self::measure_free_space`] can read
     /// the sector as the truth.
-    fn flush_volume_metadata(&self) -> bool {
+    fn flush_volume_metadata(&self) -> Result<(), FreeSpaceState> {
         match self.mgr.close_volume(self.volume.get()) {
             // The volume was not closed. Every operation closes its handles
             // before returning, so this cannot happen, but the mounted
             // volume is still valid and must not be reopened over.
-            Err(embedded_sdmmc::Error::VolumeStillInUse) => false,
+            Err(embedded_sdmmc::Error::VolumeStillInUse) => Err(FreeSpaceState::FlushFailed),
             // Every other outcome (including a failed FSInfo write) removed
             // the volume from the manager, so a reopen is required either
-            // way -- and it must not give up on one transient read miss,
-            // because a failed reopen leaves the stored handle dead and
-            // every later operation reporting a bad handle until the card
-            // is remounted. A later free-space query lands back here to
-            // retry the reopen even then.
-            _ => {
-                for _ in 0..3 {
-                    if let Ok(volume) = self
-                        .mgr
-                        .open_raw_volume(VolumeIdx(usize::from(self.layout.partition_index)))
-                    {
-                        self.volume.set(volume);
-                        return true;
-                    }
-                }
-                false
-            }
+            // way. A failed reopen leaves the stored handle dead and every
+            // later operation reporting a bad handle until it is repaired:
+            // the caller latches `VolumeDead` and each later free-space
+            // query retries only the reopen until one succeeds.
+            _ => self
+                .reopen_volume()
+                .map_err(|_| FreeSpaceState::VolumeDead),
         }
+    }
+
+    /// Re-open the mounted partition and store the fresh handle. The single
+    /// volume-handle repair sequence shared by the flush path and the
+    /// `VolumeDead` self-heal.
+    fn reopen_volume(&self) -> Result<(), embedded_sdmmc::Error<D::Error>> {
+        let volume = self
+            .mgr
+            .open_raw_volume(VolumeIdx(usize::from(self.layout.partition_index)))?;
+        self.volume.set(volume);
+        Ok(())
+    }
+
+    /// One read of the volume's boot sector: cheap, read-only proof
+    /// the card still answers before rollback mutations are attempted. This
+    /// only proves reads work; a card that fails only writes passes, but
+    /// then every rollback write fails and is swallowed without persisting
+    /// anything destructive.
+    fn device_is_responding(&self) -> bool {
+        self.mgr
+            .device(|device| read_device_sector(device, self.layout.start_lba))
+            .is_some()
+    }
+
+    /// Decide whether cleanup/rollback mutations may follow a failed
+    /// mutating step, re-tagging an error the manager is known to mask.
+    ///
+    /// `VolumeManager::write` reports a device fault met while extending a
+    /// file as `DiskFull` and one met right after a successful extension as
+    /// `AllocationError`, so neither can be taken at face value:
+    /// `AllocationError` has no non-fault producer and is treated as a
+    /// device fault outright; `DiskFull` is usually genuine (and rollback is
+    /// then exactly what is wanted), so the card is probed first, and a
+    /// failed probe re-tags the error as [`FsOpError::DeviceUnresponsive`].
+    ///
+    /// Returns the (possibly re-tagged) error and whether rollback
+    /// mutations are safe to attempt.
+    fn assess_failure(&self, error: FsOpError<D::Error>) -> (FsOpError<D::Error>, bool) {
+        use embedded_sdmmc::Error;
+        if matches!(
+            error,
+            FsOpError::Fs(Error::DeviceError(_) | Error::AllocationError)
+                | FsOpError::DeviceUnresponsive
+                | FsOpError::DeleteIncomplete(_)
+                | FsOpError::CleanupIncomplete(_)
+                | FsOpError::SourceRemains(_)
+        ) {
+            return (error, false);
+        }
+        if matches!(error, FsOpError::Fs(Error::DiskFull)) && !self.device_is_responding() {
+            return (FsOpError::DeviceUnresponsive, false);
+        }
+        (error, true)
     }
 
     fn measure_free_space(&self) -> Option<u64> {
@@ -1520,7 +1723,19 @@ impl<D: BlockDevice> CardFs<D> {
     fn open_dir_path(&self, path: &str) -> Result<RawDirectory, FsOpError<D::Error>> {
         let mut dir = self.mgr.open_root_dir(self.volume.get())?;
         for component in components(path) {
-            match self.mgr.open_dir(dir, component) {
+            let next = match self.mgr.open_dir(dir, component) {
+                // The manager launders FAT-chain read errors into NotFound
+                // (see [`Self::find_entry`]); confirm a missing path
+                // component with a cache-dropped second ask before failing
+                // the whole walk, so every path-based operation shares the
+                // same two-laundered-reads residue as the leaf lookups.
+                Err(embedded_sdmmc::Error::NotFound) => {
+                    self.drop_block_cache();
+                    self.mgr.open_dir(dir, component)
+                }
+                other => other,
+            };
+            match next {
                 Ok(next) => {
                     let _ = self.mgr.close_dir(dir);
                     dir = next;
@@ -1552,27 +1767,66 @@ impl<D: BlockDevice> CardFs<D> {
     /// file handle stays valid after its parent directory is closed.
     fn open_file_at(&self, path: &str, mode: Mode) -> Result<RawFile, FsOpError<D::Error>> {
         self.with_dir(&parent_path(path), |dir| {
-            self.mgr
-                .open_file_in_dir(dir, leaf_name(path), mode)
-                .map_err(FsOpError::from)
+            match self.mgr.open_file_in_dir(dir, leaf_name(path), mode) {
+                // The open's internal lookup launders FAT-chain read errors
+                // into NotFound like every manager directory walk (see
+                // [`Self::find_entry`]); confirm with a cache-dropped second
+                // ask before reporting a missing file.
+                Err(embedded_sdmmc::Error::NotFound) => {
+                    self.drop_block_cache();
+                    self.mgr
+                        .open_file_in_dir(dir, leaf_name(path), mode)
+                        .map_err(FsOpError::from)
+                }
+                other => other.map_err(FsOpError::from),
+            }
         })
     }
 
+    /// Look up `path`, accepting a `NotFound` answer only after a second,
+    /// cache-dropped ask of the same open directory agrees. The manager
+    /// launders FAT-chain read errors into `NotFound` (see
+    /// [`Self::entry_confirmed_absent`]), and several callers act
+    /// destructively on absence -- skipping a save's backup staging, reusing
+    /// a staging name, trusting that a move's destination is free -- while
+    /// others treat absence as proof an operation landed. Confirming here
+    /// covers every caller; a wrong verdict now needs two laundered reads in
+    /// a row: the accepted residue.
     fn find_entry(&self, path: &str) -> Result<DirEntry, FsOpError<D::Error>> {
         self.with_dir(&parent_path(path), |dir| {
-            self.mgr
-                .find_directory_entry(dir, leaf_name(path))
-                .map_err(FsOpError::from)
+            match self.mgr.find_directory_entry(dir, leaf_name(path)) {
+                Err(embedded_sdmmc::Error::NotFound) => {
+                    self.drop_block_cache();
+                    self.mgr
+                        .find_directory_entry(dir, leaf_name(path))
+                        .map_err(FsOpError::from)
+                }
+                other => other.map_err(FsOpError::from),
+            }
         })
+    }
+
+    /// Invalidate the manager's one-block cache (`device()` drops it as a
+    /// side effect of handing out the device), so the next read fetches
+    /// true on-disk state instead of a failed attempt's echo or a stale
+    /// block.
+    fn drop_block_cache(&self) {
+        self.mgr.device(|_| ());
     }
 
     fn delete_file_at(&self, path: &str) -> Result<(), FsOpError<D::Error>> {
         self.with_dir(&parent_path(path), |dir| {
-            self.reclaim_file_clusters_in_dir(dir, leaf_name(path));
-            self.mgr
-                .delete_entry_in_dir(dir, leaf_name(path))
-                .map_err(FsOpError::from)
+            self.delete_file_in_dir(dir, leaf_name(path))
         })
+    }
+
+    /// The truncate-then-checked-delete pairing every file removal shares.
+    /// The result encodes destruction: `Ok` or `DeleteIncomplete` means the
+    /// contents (and possibly the entry) are gone; every other error refused
+    /// before destroying anything.
+    fn delete_file_in_dir(&self, dir: RawDirectory, name: &str) -> Result<(), FsOpError<D::Error>> {
+        let truncated = self.reclaim_file_clusters_in_dir(dir, name);
+        self.delete_entry_checked(dir, name, truncated)
     }
 
     /// Best-effort, FAT32-only: free a file's cluster chain (all but the
@@ -1584,16 +1838,115 @@ impl<D: BlockDevice> CardFs<D> {
     /// stays unreclaimed. Gated off FAT16 because the manager accepts a
     /// corrupt FAT16 chain stepping onto entry 0x0000 as valid, and a
     /// truncate would then clobber FAT entry 0.
-    fn reclaim_file_clusters_in_dir(&self, dir: RawDirectory, name: &str) {
+    ///
+    /// Returns whether the destructive truncate persisted (or, on a device
+    /// error mid-truncate, may have): the contents are gone even though the
+    /// entry remains.
+    fn reclaim_file_clusters_in_dir(&self, dir: RawDirectory, name: &str) -> bool {
         if !self.layout.fat32 {
-            return;
+            return false;
         }
-        if let Ok(file) = self
+        match self
             .mgr
             .open_file_in_dir(dir, name, Mode::ReadWriteTruncate)
         {
-            let _ = self.mgr.close_file(file);
+            Ok(file) => {
+                let _ = self.mgr.close_file(file);
+                true
+            }
+            // A device error can strike mid-truncate, after FAT sectors were
+            // already rewritten; treat destruction as possible. Every other
+            // error (NotFound, FileAlreadyOpen, OpenedDirAsFile...) means
+            // the open refused before touching anything.
+            Err(embedded_sdmmc::Error::DeviceError(_)) => true,
+            Err(_) => false,
         }
+    }
+
+    /// Whether a fresh lookup confirms `name` is absent from `dir`. The
+    /// manager launders FAT-chain read errors into `NotFound` (its
+    /// directory walks discard `next_cluster` failures and fall through to
+    /// "no such entry"), so a `NotFound` from a delete is never taken at
+    /// face value: absence must be confirmed by a second, independent walk.
+    /// That walk can launder too, so a wrong verdict now needs two
+    /// laundered reads in a row -- the accepted residue.
+    fn entry_confirmed_absent(&self, dir: RawDirectory, name: &str) -> bool {
+        // Drop the cache first so the lookup reads true on-disk state.
+        self.drop_block_cache();
+        matches!(
+            self.mgr.find_directory_entry(dir, name),
+            Err(embedded_sdmmc::Error::NotFound)
+        )
+    }
+
+    /// Delete `name` in `dir`, reporting [`FsOpError::DeleteIncomplete`]
+    /// when the delete still fails after `truncated` destruction has
+    /// already persisted.
+    ///
+    /// The retries are cache-aware: a failed attempt may have left its own
+    /// modified directory block in the manager's one-block cache, so a bare
+    /// retry would read that echo back and see the entry as already deleted
+    /// while the card never acknowledged the write. Dropping the cache
+    /// (`device()` invalidates it) makes each retry re-read the true
+    /// on-disk block -- after which a NotFound means the earlier attempt's
+    /// write reached the card (a late-status error) and the delete won,
+    /// once [`Self::entry_confirmed_absent`] rules out a laundered read
+    /// error.
+    fn delete_entry_checked(
+        &self,
+        dir: RawDirectory,
+        name: &str,
+        truncated: bool,
+    ) -> Result<(), FsOpError<D::Error>> {
+        // First attempt: a *confirmed* NotFound is the caller's genuine
+        // "no such entry" answer -- unless the truncate just persisted, in
+        // which case the entry provably existed moments ago and a confirmed
+        // absence with no delete write issued is almost certainly a
+        // double-laundered read; the honest report is then the emptied
+        // ghost, never "file not found".
+        let mut outcome = match self.mgr.delete_entry_in_dir(dir, name) {
+            Err(error @ embedded_sdmmc::Error::NotFound)
+                if self.entry_confirmed_absent(dir, name) =>
+            {
+                return Err(if truncated {
+                    FsOpError::DeleteIncomplete(Box::new(error.into()))
+                } else {
+                    error.into()
+                });
+            }
+            // Ok, a real error, or an unconfirmed NotFound (the entry is
+            // still listed, or the confirming lookup itself failed).
+            other => other,
+        };
+        for _ in 1..DELETE_RETRY_ATTEMPTS {
+            if outcome.is_ok() {
+                break;
+            }
+            self.drop_block_cache();
+            outcome = match self.mgr.delete_entry_in_dir(dir, name) {
+                Err(embedded_sdmmc::Error::NotFound)
+                    if self.entry_confirmed_absent(dir, name) =>
+                {
+                    Ok(())
+                }
+                other => other,
+            };
+        }
+        if outcome.is_err() {
+            // The final failed attempt also left its echo in the cache;
+            // drop it so later reads report the true on-disk state (the
+            // entry still listed) instead of the phantom deletion.
+            self.drop_block_cache();
+        }
+        outcome.map_err(|error| match error {
+            // An unconfirmed NotFound: the delete claims the entry is
+            // gone, but the lookup says otherwise (or could not tell).
+            // Never report "file not found" for an entry that is still
+            // listed.
+            embedded_sdmmc::Error::NotFound if !truncated => FsOpError::VerifyFailed,
+            error if truncated => FsOpError::DeleteIncomplete(Box::new(error.into())),
+            error => FsOpError::from(error),
+        })
     }
 
     pub fn read_directory_page(
@@ -1721,7 +2074,7 @@ impl<D: BlockDevice> CardFs<D> {
     }
 
     pub fn create_empty(&self, path: &str) -> Result<(), FsOpError<D::Error>> {
-        self.free_space_stale.set(true);
+        self.mark_free_space_stale();
         self.with_dir(&parent_path(path), |dir| {
             let leaf = leaf_name(path);
             match self.mgr.find_directory_entry(dir, leaf) {
@@ -1742,7 +2095,7 @@ impl<D: BlockDevice> CardFs<D> {
     }
 
     pub fn create_directory_verified(&self, path: &str) -> Result<(), FsOpError<D::Error>> {
-        self.free_space_stale.set(true);
+        self.mark_free_space_stale();
         self.with_dir(&parent_path(path), |dir| {
             let leaf = leaf_name(path);
             match self.mgr.find_directory_entry(dir, leaf) {
@@ -1761,6 +2114,9 @@ impl<D: BlockDevice> CardFs<D> {
 
     /// Whether `path` names an existing entry. Short names have no case, so
     /// unlike the old case-exact check this is inherently case-insensitive.
+    /// A `NotFound` is confirmed by a second, cache-dropped lookup before
+    /// being reported as absence (see [`Self::find_entry`]): callers such as
+    /// the save's staging-name scan act destructively on the answer.
     pub fn entry_exists(&self, path: &str) -> Result<bool, FsOpError<D::Error>> {
         match self.find_entry(path) {
             Ok(_) => Ok(true),
@@ -1774,7 +2130,7 @@ impl<D: BlockDevice> CardFs<D> {
     /// source; a folder is copied recursively. The destination is never
     /// replaced.
     pub fn move_entry_verified(&self, from: &str, to: &str) -> Result<(), FsOpError<D::Error>> {
-        self.free_space_stale.set(true);
+        self.mark_free_space_stale();
         let from_parent = parent_path(from);
         let to_parent = parent_path(to);
         let from_sfn = ShortFileName::create_from_str(leaf_name(from))
@@ -1804,40 +2160,93 @@ impl<D: BlockDevice> CardFs<D> {
         if entry.attributes.is_directory() {
             self.check_subtree_mutable(from, 0)?;
             if let Err(error) = self.copy_dir_recursive(from, to, 0) {
-                // Mirror copy_file_verified: after a device error nothing
-                // more is trustworthy, but otherwise remove the partial
-                // destination so a retry is not refused as AlreadyExists.
-                // Safe to remove: the pre-check above proved `to` was absent.
-                if !error.is_device_error() {
-                    let _ = self.delete_recursive(to, 0);
-                }
-                return Err(error);
+                // Safe to remove the partial destination: the pre-check
+                // above proved `to` was absent.
+                // Destruction progress is irrelevant on these two paths:
+                // cleanup failures become CleanupIncomplete and source-delete
+                // failures become success-with-caveat either way.
+                return Err(
+                    self.cleanup_partial_destination(error, || {
+                        self.delete_recursive(to, 0, &mut false)
+                    })
+                );
             }
-            self.delete_recursive(from, 0)?;
+            if let Err(error) = self.delete_recursive(from, 0, &mut false) {
+                return Err(Self::wrap_source_delete_failure(error));
+            }
         } else {
             self.copy_file_verified(from, to)?;
-            self.delete_file_at(from)?;
+            if let Err(error) = self.delete_file_at(from) {
+                return Err(Self::wrap_source_delete_failure(error));
+            }
         }
+        // Both re-checks are advisory: the destination provably holds a
+        // byte-verified copy and the source delete already confirmed its
+        // removal internally, so a verification read flake must never
+        // convert a landed move into a reported failure (that invites the
+        // user to "clean up" the only good copy).
         match self.find_entry(from) {
-            Err(error) if error.is_not_found() => {}
-            Err(error) => return Err(error),
-            Ok(_) => return Err(FsOpError::VerifyFailed),
+            // Still listed after its delete reported success: success with
+            // a caveat, never "<verb> failed".
+            Ok(_) => return Err(FsOpError::SourceRemains(Box::new(FsOpError::VerifyFailed))),
+            // Confirmed absence, or the verification read itself failed.
+            Err(_) => {}
         }
-        self.find_entry(to)?;
-        Ok(())
+        match self.find_entry(to) {
+            Ok(_) => Ok(()),
+            // A *confirmed* absence of the destination that held a verified
+            // copy moments ago: report verification failure, never "file
+            // not found".
+            Err(error) if error.is_not_found() => Err(FsOpError::VerifyFailed),
+            // Verification read flake after a fully-landed move.
+            Err(_) => Ok(()),
+        }
+    }
+
+    /// Post-copy source-delete failures are success-with-caveat: the
+    /// destination already holds the verified copy and must never be rolled
+    /// back (after a truncate it may be the only good copy). Keep
+    /// [`FsOpError::DeleteIncomplete`]'s precise "emptied ghost" report and
+    /// wrap every other failure as [`FsOpError::SourceRemains`], so no
+    /// caller reports "<verb> failed" while the move actually landed.
+    fn wrap_source_delete_failure(error: FsOpError<D::Error>) -> FsOpError<D::Error> {
+        match error {
+            error @ FsOpError::DeleteIncomplete(_) => error,
+            other => FsOpError::SourceRemains(Box::new(other)),
+        }
+    }
+
+    /// Assess a failed copy (`assess_failure` refuses further mutations
+    /// after proven or plausibly masked device faults), run the
+    /// partial-destination `cleanup` when rollback is safe so a retry is
+    /// not refused as AlreadyExists, and fold a failed cleanup into
+    /// [`FsOpError::CleanupIncomplete`] so the retry-blocking ghost is
+    /// reported instead of swallowed. `NotFound` from the cleanup is clean:
+    /// the copy failed before the destination was ever created.
+    fn cleanup_partial_destination(
+        &self,
+        error: FsOpError<D::Error>,
+        cleanup: impl FnOnce() -> Result<(), FsOpError<D::Error>>,
+    ) -> FsOpError<D::Error> {
+        let (error, rollback) = self.assess_failure(error);
+        if rollback {
+            match cleanup() {
+                Ok(()) => {}
+                Err(cleanup_error) if cleanup_error.is_not_found() => {}
+                Err(_) => return FsOpError::CleanupIncomplete(Box::new(error)),
+            }
+        }
+        error
     }
 
     /// Copy a file and prove the destination matches the source, removing a
     /// partial destination on failure (unless the device itself failed, after
-    /// which no further mutations are trustworthy).
+    /// which no further mutations are trustworthy). A failed removal leaves
+    /// a ghost that will block retries as AlreadyExists, so it surfaces as
+    /// [`FsOpError::CleanupIncomplete`] instead of being swallowed.
     fn copy_file_verified(&self, from: &str, to: &str) -> Result<(), FsOpError<D::Error>> {
-        let result = self.copy_file_contents(from, to, Mode::ReadWriteCreate);
-        if let Err(error) = &result {
-            if !error.is_device_error() {
-                let _ = self.delete_file_at(to);
-            }
-        }
-        result
+        self.copy_file_contents(from, to, Mode::ReadWriteCreate)
+            .map_err(|error| self.cleanup_partial_destination(error, || self.delete_file_at(to)))
     }
 
     /// Streams `from` into `to` through a fixed window and then proves the
@@ -1955,7 +2364,12 @@ impl<D: BlockDevice> CardFs<D> {
         Ok(())
     }
 
-    fn delete_recursive(&self, path: &str, depth: usize) -> Result<(), FsOpError<D::Error>> {
+    fn delete_recursive(
+        &self,
+        path: &str,
+        depth: usize,
+        destroyed: &mut bool,
+    ) -> Result<(), FsOpError<D::Error>> {
         if depth >= MAX_TREE_DEPTH {
             return Err(FsOpError::TooDeep);
         }
@@ -1976,17 +2390,22 @@ impl<D: BlockDevice> CardFs<D> {
                         // read-only subtrees before mutating anything.
                         return Err(FsOpError::Fs(embedded_sdmmc::Error::ReadOnly));
                     }
-                    self.reclaim_file_clusters_in_dir(dir, child.name.as_str());
-                    self.mgr
-                        .delete_entry_in_dir(dir, child.name.as_str())
-                        .map_err(FsOpError::from)?;
+                    let result = self.delete_file_in_dir(dir, child.name.as_str());
+                    // Ok means the entry is gone; DeleteIncomplete means the
+                    // truncate persisted. Either way destruction has begun,
+                    // and any later failure must not claim nothing was
+                    // deleted.
+                    if matches!(result, Ok(()) | Err(FsOpError::DeleteIncomplete(_))) {
+                        *destroyed = true;
+                    }
+                    result?;
                 }
                 Ok(())
             })?;
             // The handle above is closed before recursing, so nesting never
             // stacks directory handles against the manager's limits.
             for child in batch.iter().filter(|child| child.is_dir) {
-                self.delete_recursive(&join_path(path, &child.name), depth + 1)?;
+                self.delete_recursive(&join_path(path, &child.name), depth + 1, destroyed)?;
             }
         }
         self.delete_file_at(path)
@@ -2062,7 +2481,7 @@ impl<D: BlockDevice> CardFs<D> {
     }
 
     pub fn delete_verified(&self, path: &str, is_dir: bool) -> Result<(), FsOpError<D::Error>> {
-        self.free_space_stale.set(true);
+        self.mark_free_space_stale();
         let entry = self.find_entry(path)?;
         if entry.attributes.is_directory() != is_dir {
             return Err(if is_dir {
@@ -2078,15 +2497,34 @@ impl<D: BlockDevice> CardFs<D> {
             return Err(FsOpError::Fs(embedded_sdmmc::Error::ReadOnly));
         }
         if is_dir {
+            // The read-only pre-scan destroys nothing; once the recursive
+            // delete has removed any child, a later failure must surface as
+            // "incomplete" -- never as a refusal implying the folder is
+            // intact (FAT16 has no truncate, so per-file tracking alone
+            // would miss every removed child there).
             self.check_subtree_mutable(path, 0)?;
-            self.delete_recursive(path, 0)?;
+            let mut destroyed = false;
+            self.delete_recursive(path, 0, &mut destroyed)
+                .map_err(|error| match error {
+                    error @ FsOpError::DeleteIncomplete(_) => error,
+                    other if destroyed => FsOpError::DeleteIncomplete(Box::new(other)),
+                    other => other,
+                })?;
         } else {
             self.delete_file_at(path)?;
         }
+        // Advisory re-check: delete_entry_checked already double-confirmed
+        // the removal (or its write was acknowledged), so a verification
+        // read flake must never convert the completed delete into a
+        // "Not deleted" report.
         match self.find_entry(path) {
             Err(error) if error.is_not_found() => Ok(()),
-            Err(error) => Err(error),
-            Ok(_) => Err(FsOpError::VerifyFailed),
+            // A positive sighting after the delete reported success: at
+            // minimum the truncate or child clearing persisted, so the
+            // honest report is "incomplete", never a refusal.
+            Ok(_) => Err(FsOpError::DeleteIncomplete(Box::new(FsOpError::VerifyFailed))),
+            // The verification read itself failed; the delete stands.
+            Err(_) => Ok(()),
         }
     }
 
@@ -2094,7 +2532,7 @@ impl<D: BlockDevice> CardFs<D> {
     /// The close before verification matters: writes are durable only once
     /// the file is closed.
     pub fn save_verified(&self, path: &str, contents: &[u8]) -> Result<(), FsOpError<D::Error>> {
-        self.free_space_stale.set(true);
+        self.mark_free_space_stale();
         self.write_file(path, contents)?;
         self.verify_file(path, contents)
     }
@@ -2148,30 +2586,41 @@ impl<D: BlockDevice> CardFs<D> {
     /// both recoverable on a PC. That window, and needing free space for
     /// both staging copies (roughly twice the document size), are the cost
     /// of a rename-less filesystem.
+    ///
+    /// A failed save reports any surviving backup of the old contents via
+    /// [`SaveError::backup_kept`], so the caller can point the user at it.
     pub fn save_transactional(
         &self,
         path: &str,
         contents: &[u8],
-    ) -> Result<(), FsOpError<D::Error>> {
-        self.free_space_stale.set(true);
+    ) -> Result<(), SaveError<D::Error>> {
+        self.mark_free_space_stale();
         let directory = parent_path(path);
+        // Confirmed lookup: a single laundered NotFound here would skip the
+        // pre-checks below AND the backup staging, after which the in-place
+        // rewrite destroys the only copy of an existing document.
         let existed = match self.find_entry(path) {
-            Ok(entry) if entry.attributes.is_directory() => return Err(FsOpError::IsADirectory),
+            Ok(entry) if entry.attributes.is_directory() => {
+                return Err(FsOpError::IsADirectory.into());
+            }
             Ok(entry) if entry.attributes.is_read_only() => {
-                return Err(FsOpError::Fs(embedded_sdmmc::Error::ReadOnly));
+                return Err(FsOpError::Fs(embedded_sdmmc::Error::ReadOnly).into());
             }
             // The editor only opens documents within MAX_DOCUMENT_BYTES, so a
             // larger target proves the file changed on another machine since
             // it was loaded; refuse to clobber it (this also caps how much
             // the backup staging below can be asked to copy).
             Ok(entry) if entry.size as usize > MAX_DOCUMENT_BYTES => {
-                return Err(FsOpError::TooLarge);
+                return Err(FsOpError::TooLarge.into());
             }
             Ok(_) => true,
             Err(error) if error.is_not_found() => false,
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         };
 
+        // Each probe's absence answer is confirmed by find_entry's in-dir
+        // re-ask, so the scan's cost is bounded by two directory walks plus
+        // two cache-dropped re-reads of the already-open parent.
         let mut suffix = 0u16;
         let (temporary, backup) = loop {
             let temporary = join_path(&directory, &alloc::format!("~WIO{suffix:04X}.TMP"));
@@ -2181,18 +2630,25 @@ impl<D: BlockDevice> CardFs<D> {
             }
             suffix = suffix
                 .checked_add(1)
-                .ok_or(FsOpError::Fs(embedded_sdmmc::Error::DiskFull))?;
+                .ok_or_else(|| SaveError::from(FsOpError::Fs(embedded_sdmmc::Error::DiskFull)))?;
         };
 
         // Prove the card can store the new contents before the original is
         // touched.
         if let Err(error) = self.save_verified(&temporary, contents) {
-            // Do not perform more mutations after a device I/O error: the
+            // Do not perform more mutations after a device I/O error (proven,
+            // or plausibly hiding behind the manager's DiskFull masking): the
             // mounted metadata cache no longer proves what reached the card.
-            if !error.is_device_error() {
+            // Rollback deletes here and below are deliberately best-effort
+            // (unlike copy/move's CleanupIncomplete reporting): staging
+            // leftovers are tolerated by design and surfaced via
+            // SaveError::backup_kept where they matter, so a cleanup flake
+            // never converts a clean failure report into a worse one.
+            let (error, rollback) = self.assess_failure(error);
+            if rollback {
                 let _ = self.delete_file_at(&temporary);
             }
-            return Err(error);
+            return Err(error.into());
         }
 
         // Keep the original contents reachable under the backup name for as
@@ -2201,16 +2657,19 @@ impl<D: BlockDevice> CardFs<D> {
         // transits RAM.
         if existed {
             if let Err(error) = self.copy_file_contents(path, &backup, Mode::ReadWriteCreate) {
-                if !error.is_device_error() {
+                let (error, rollback) = self.assess_failure(error);
+                if rollback {
                     let _ = self.delete_file_at(&backup);
                     let _ = self.delete_file_at(&temporary);
                 }
-                return Err(error);
+                return Err(error.into());
             }
         }
 
         if let Err(error) = self.save_verified(path, contents) {
-            if !error.is_device_error() {
+            let (error, rollback) = self.assess_failure(error);
+            let mut backup_kept = None;
+            if rollback {
                 if existed {
                     // Restore the target from the on-card backup; the copy
                     // verifies itself, so success proves the original is back
@@ -2223,14 +2682,22 @@ impl<D: BlockDevice> CardFs<D> {
                         .is_ok()
                     {
                         let _ = self.delete_file_at(&temporary);
-                        let _ = self.delete_file_at(&backup);
+                        if self.delete_file_at(&backup).is_err() {
+                            backup_kept = Some(backup.clone());
+                        }
+                    } else {
+                        backup_kept = Some(backup.clone());
                     }
                 } else {
                     let _ = self.delete_file_at(path);
                     let _ = self.delete_file_at(&temporary);
                 }
+            } else if existed {
+                // No rollback: the target may be partial and both staging
+                // files were deliberately left in place.
+                backup_kept = Some(backup.clone());
             }
-            return Err(error);
+            return Err(SaveError { error, backup_kept });
         }
 
         // The target now contains verified data. A stale temporary or backup
@@ -2245,19 +2712,79 @@ impl<D: BlockDevice> CardFs<D> {
     }
 }
 
-/// Read one sector through a mounted volume's block device, retrying like
-/// [`SdStream`] does: single reads flake on real cards, and the FAT16 scan
-/// chains hundreds of them, so one transient miss must not blank the
-/// figure.
+/// Read one sector through a mounted volume's block device. Transient
+/// per-command flakes are the device layer's problem (see
+/// [`SD_RETRY_ATTEMPTS`]); a miss surfacing here blanks the figure.
 fn read_device_sector<D: BlockDevice>(device: &D, lba: u32) -> Option<[u8; 512]> {
     let mut block = [Block::new()];
-    for _ in 0..3 {
-        if device.read(&mut block, BlockIdx(lba)).is_ok() {
-            let [block] = block;
-            return Some(block.contents);
+    if device.read(&mut block, BlockIdx(lba)).is_err() {
+        return None;
+    }
+    let [block] = block;
+    Some(block.contents)
+}
+
+/// Write one sector through a mounted volume's block device; same
+/// transient-flake contract as [`read_device_sector`].
+fn write_device_sector<D: BlockDevice>(device: &D, lba: u32, contents: &[u8; 512]) -> bool {
+    let mut block = Block::new();
+    block.contents = *contents;
+    device.write(&[block], BlockIdx(lba)).is_ok()
+}
+
+/// The manager's free-cluster search scans whole FAT sectors without
+/// re-checking its end bound mid-sector, so zeroed phantom entries after
+/// the last real cluster's entry in the FAT's final entry-holding sector
+/// would be handed out as allocatable clusters mapping past the end of the
+/// partition once the card fills up. This firmware's formatter marks those
+/// entries bad at format time; foreign formatters commonly leave them
+/// zeroed, so mounting applies the same marks to any card. Best-effort and
+/// idempotent: only exactly-zero (free) phantom entries are rewritten --
+/// pre-existing bad marks or foreign garbage are left for a PC disk check
+/// -- and any failure leaves the card as it was (a healthy or already
+/// marked card costs one read per FAT copy and no writes).
+fn repair_phantom_fat_tail<D: BlockDevice>(device: &D, layout: &MediaLayout) {
+    let Some(boot) = read_device_sector(device, layout.start_lba) else {
+        return;
+    };
+    let BootSector::Fat(geometry) = parse_fat_boot_sector(&boot) else {
+        return;
+    };
+    if !geometry.fat32 {
+        return;
+    }
+    // Entries 0..2 are reserved, so cluster N's entry ends at (N + 3) * 4
+    // bytes into the FAT. cluster_count tops out at 0x0fff_fff5, so the
+    // byte total fits u32.
+    let entry_bytes = (geometry.cluster_count + 2) * 4;
+    let phantom_offset = (entry_bytes % 512) as usize;
+    if phantom_offset == 0 {
+        return;
+    }
+    // The sector holding the last real entry, located from the cluster
+    // count rather than fat_sectors: a foreign formatter may over-provision
+    // the FAT, and the manager's scan can only overrun within this sector
+    // (its per-sector end-bound check stops it before any spare sector).
+    let last_entry_sector = entry_bytes / 512;
+    for copy in 0..u32::from(geometry.fat_copies) {
+        let lba = layout.start_lba
+            + geometry.reserved_sectors
+            + copy * geometry.fat_sectors
+            + last_entry_sector;
+        let Some(mut sector) = read_device_sector(device, lba) else {
+            continue;
+        };
+        let mut changed = false;
+        for entry in sector[phantom_offset..].as_chunks_mut::<4>().0 {
+            if *entry == [0u8; 4] {
+                put_u32(entry, 0x0fff_fff7);
+                changed = true;
+            }
+        }
+        if changed {
+            let _ = write_device_sector(device, lba, &sector);
         }
     }
-    None
 }
 
 fn components(path: &str) -> impl Iterator<Item = &str> {
@@ -2283,11 +2810,21 @@ fn is_listable(entry: &DirEntry) -> bool {
 }
 
 /// True when `path` lies strictly inside the directory `ancestor`.
+/// Compared as bytes: paths may contain multi-byte characters (stored 8.3
+/// high bytes re-rendered by ShortFileName's Display), so a str slice at
+/// `ancestor.len()` could split a character and panic.
 fn path_is_inside(ancestor: &str, path: &str) -> bool {
+    let (ancestor, path) = (ancestor.as_bytes(), path.as_bytes());
     path.len() > ancestor.len()
         && path[..ancestor.len()].eq_ignore_ascii_case(ancestor)
-        && path.as_bytes()[ancestor.len()] == b'/'
+        && path[ancestor.len()] == b'/'
 }
+
+/// The status wording for a move/rename whose source entry survived
+/// ([`FsOpError::SourceRemains`]): shared between [`save_failure_reason`]
+/// and the firmware's success-with-caveat explorer status so the two can
+/// never drift apart.
+pub const OLD_ENTRY_REMAINS: &str = "old entry remains";
 
 /// Reduce a filesystem/device error to a message that fits the Wio
 /// Terminal's 32-column status line.
@@ -2311,10 +2848,21 @@ pub fn save_failure_reason<E: core::error::Error>(error: &FsOpError<E>) -> Strin
         FsOpError::VerifyFailed => "verify failed".into(),
         FsOpError::TooLarge => "file too large".into(),
         FsOpError::TooDeep => "folders too deep".into(),
+        FsOpError::DeviceUnresponsive => "SD not responding".into(),
+        FsOpError::DeleteIncomplete(_) => "data removed".into(),
+        // "Rename failed: partial copy left" is exactly 32 columns; the
+        // leftover is the actionable fact, so it wins over the original
+        // failure's wording.
+        FsOpError::CleanupIncomplete(_) => "partial copy left".into(),
+        // Success-with-caveat in the move UI (the destination holds the
+        // verified copy); the same wording the explorer status uses via
+        // [`OLD_ENTRY_REMAINS`].
+        FsOpError::SourceRemains(_) => OLD_ENTRY_REMAINS.into(),
         FsOpError::Fs(Error::DeleteNonEmptyDir) => "folder is not empty".into(),
-        FsOpError::Fs(Error::DiskFull | Error::NotEnoughSpace | Error::AllocationError) => {
-            "storage is full".into()
-        }
+        FsOpError::Fs(Error::DiskFull | Error::NotEnoughSpace) => "storage is full".into(),
+        // Its only producer is a device fault met right after a successful
+        // cluster extension; calling that a full disk would be a lie.
+        FsOpError::Fs(Error::AllocationError) => "SD card fault".into(),
         FsOpError::Fs(Error::ReadOnly) => "file is read-only".into(),
         FsOpError::Fs(Error::FilenameError(_) | Error::ConversionError) => {
             "invalid file name".into()
@@ -2472,6 +3020,18 @@ mod tests {
             validate_entry_name("Dir."),
             Err("Name cannot end with a dot")
         );
+        // ShortFileName also collapses repeated interior dots ("A..TXT"
+        // parses to "A.TXT"); the round-trip guard refuses anything whose
+        // stored form would differ from the typed name.
+        assert_eq!(
+            validate_entry_name("A..TXT"),
+            Err("Name would be stored differently")
+        );
+        assert!(validate_entry_name(".TXT").is_err());
+        assert!(validate_entry_name("A.B.TXT").is_err());
+        // Case-only differences survive the round-trip: 8.3 names store
+        // uppercase, and the keyboard types lowercase.
+        assert!(validate_entry_name("notes.txt").is_ok());
         assert!(is_txt_file("NOTES.TxT"));
         assert!(!is_txt_file("notes.md"));
         assert_eq!(leaf_name("/A/B.TXT"), "B.TXT");
@@ -2636,10 +3196,28 @@ mod tests {
         /// After this many successful writes, latch `fail_writes`: a card
         /// that dies mid-operation and stays dead.
         fail_writes_after: Rc<Cell<Option<u32>>>,
+        /// After this many write calls, fail exactly one write, then behave
+        /// normally: a transient write flake.
+        fail_one_write_after: Rc<Cell<Option<u32>>>,
+        /// After this many write calls the card dies completely: every later
+        /// read AND write fails until `fail_writes`/`fail_reads` are cleared.
+        die_after_writes: Rc<Cell<Option<u32>>>,
+        /// Latched total read failure (a dead card).
+        fail_reads: Rc<Cell<bool>>,
         writes_seen: Rc<Cell<u32>>,
+        reads_seen: Rc<Cell<u32>>,
         /// Fail this many read calls, then behave normally: the transient
         /// per-command misses real cards produce.
         fail_next_reads: Rc<Cell<u32>>,
+        /// After this many read calls, fail exactly one read, then behave
+        /// normally: a transient read flake at a chosen position.
+        fail_one_read_after: Rc<Cell<Option<u32>>>,
+        /// Fail every read whose block range intersects `[start, end)`: a
+        /// region (e.g. the whole FAT) that stops answering. The manager's
+        /// directory walks launder such chain-read failures into NotFound
+        /// on *every* walk -- the correlated double-laundered residue the
+        /// single-flake knobs cannot produce.
+        fail_reads_in: Rc<Cell<Option<(u32, u32)>>>,
     }
 
     impl RamBlocks {
@@ -2649,9 +3227,33 @@ mod tests {
                 fail_writes: Rc::new(Cell::new(false)),
                 corrupt_one_write_after: Rc::new(Cell::new(None)),
                 fail_writes_after: Rc::new(Cell::new(None)),
+                fail_one_write_after: Rc::new(Cell::new(None)),
+                die_after_writes: Rc::new(Cell::new(None)),
+                fail_reads: Rc::new(Cell::new(false)),
                 writes_seen: Rc::new(Cell::new(0)),
+                reads_seen: Rc::new(Cell::new(0)),
                 fail_next_reads: Rc::new(Cell::new(0)),
+                fail_one_read_after: Rc::new(Cell::new(None)),
+                fail_reads_in: Rc::new(Cell::new(None)),
             }
+        }
+    }
+
+    /// Advance a fault knob's countdown by one call: `true` exactly when the
+    /// countdown expires on this call (the knob then clears so it fires
+    /// once). Every positioned knob shares this decrement so an off-by-one
+    /// fix lands in all of them at once.
+    fn countdown_fired(cell: &Cell<Option<u32>>) -> bool {
+        match cell.get() {
+            Some(0) => {
+                cell.set(None);
+                true
+            }
+            Some(remaining) => {
+                cell.set(Some(remaining - 1));
+                false
+            }
+            None => false,
         }
     }
 
@@ -2659,10 +3261,22 @@ mod tests {
         type Error = RamError;
 
         fn read(&self, output: &mut [Block], start: BlockIdx) -> Result<(), RamError> {
+            if self.fail_reads.get() {
+                return Err(RamError);
+            }
             let failures = self.fail_next_reads.get();
             if failures > 0 {
                 self.fail_next_reads.set(failures - 1);
                 return Err(RamError);
+            }
+            if countdown_fired(&self.fail_one_read_after) {
+                return Err(RamError);
+            }
+            if let Some((region_start, region_end)) = self.fail_reads_in.get() {
+                let first = start.0;
+                if first < region_end && first + output.len() as u32 > region_start {
+                    return Err(RamError);
+                }
             }
             let blocks = self.blocks.borrow();
             let start = start.0 as usize;
@@ -2671,19 +3285,24 @@ mod tests {
                 return Err(RamError);
             }
             output.clone_from_slice(&blocks[start..end]);
+            self.reads_seen.set(self.reads_seen.get() + 1);
             Ok(())
         }
 
         fn write(&self, input: &[Block], start: BlockIdx) -> Result<(), RamError> {
-            match self.fail_writes_after.get() {
-                Some(0) => {
-                    self.fail_writes.set(true);
-                    self.fail_writes_after.set(None);
-                }
-                Some(remaining) => self.fail_writes_after.set(Some(remaining - 1)),
-                None => {}
+            // die_after_writes latches before fail_writes_after so a test
+            // may arm both; the gate below then sees either latch.
+            if countdown_fired(&self.die_after_writes) {
+                self.fail_writes.set(true);
+                self.fail_reads.set(true);
+            }
+            if countdown_fired(&self.fail_writes_after) {
+                self.fail_writes.set(true);
             }
             if self.fail_writes.get() {
+                return Err(RamError);
+            }
+            if countdown_fired(&self.fail_one_write_after) {
                 return Err(RamError);
             }
             let mut blocks = self.blocks.borrow_mut();
@@ -2693,13 +3312,8 @@ mod tests {
                 return Err(RamError);
             }
             blocks[start..end].clone_from_slice(input);
-            match self.corrupt_one_write_after.get() {
-                Some(0) => {
-                    blocks[start].contents[0] ^= 0xff;
-                    self.corrupt_one_write_after.set(None);
-                }
-                Some(remaining) => self.corrupt_one_write_after.set(Some(remaining - 1)),
-                None => {}
+            if countdown_fired(&self.corrupt_one_write_after) {
+                blocks[start].contents[0] ^= 0xff;
             }
             self.writes_seen.set(self.writes_seen.get() + 1);
             Ok(())
@@ -2707,6 +3321,28 @@ mod tests {
 
         fn num_blocks(&self) -> Result<BlockCount, RamError> {
             Ok(BlockCount(self.blocks.borrow().len() as u32))
+        }
+    }
+
+    /// Device-level retry parity with the firmware's controller device
+    /// (recovery is a no-op for RAM). Used only where a test injects the
+    /// transient faults the library itself no longer retries.
+    #[derive(Clone)]
+    struct RetryBlocks(RamBlocks);
+
+    impl BlockDevice for RetryBlocks {
+        type Error = RamError;
+
+        fn read(&self, output: &mut [Block], start: BlockIdx) -> Result<(), RamError> {
+            sd_retry(|| self.0.read(output, start))
+        }
+
+        fn write(&self, input: &[Block], start: BlockIdx) -> Result<(), RamError> {
+            sd_retry(|| self.0.write(input, start))
+        }
+
+        fn num_blocks(&self) -> Result<BlockCount, RamError> {
+            sd_retry(|| self.0.num_blocks())
         }
     }
 
@@ -2838,7 +3474,7 @@ mod tests {
         fail_writes.set(true);
         assert!(matches!(
             fs.save_transactional("/DURABLE.TXT", b"new contents"),
-            Err(ref error) if error.is_device_error()
+            Err(ref error) if error.error.is_device_error()
         ));
         assert!(matches!(
             fs.create_directory_verified("/MUSTFAIL"),
@@ -3174,6 +3810,60 @@ mod tests {
         );
         assert_eq!(too_large, "Save failed: file too large");
         assert!(too_large.chars().count() <= 32);
+        assert_eq!(
+            save_failure_reason::<FakeSdError>(&FsOpError::Fs(
+                embedded_sdmmc::Error::AllocationError
+            )),
+            "SD card fault"
+        );
+        let unresponsive = alloc::format!(
+            "Rename failed: {}",
+            save_failure_reason::<FakeSdError>(&FsOpError::DeviceUnresponsive)
+        );
+        assert_eq!(unresponsive, "Rename failed: SD not responding");
+        assert!(unresponsive.chars().count() <= 32);
+        let emptied = alloc::format!(
+            "Delete incomplete: {}",
+            save_failure_reason::<FakeSdError>(&FsOpError::DeleteIncomplete(Box::new(
+                FsOpError::Fs(embedded_sdmmc::Error::DeviceError(FakeSdError))
+            )))
+        );
+        assert_eq!(emptied, "Delete incomplete: data removed");
+        assert!(emptied.chars().count() <= 32);
+        let ghost = alloc::format!(
+            "Rename failed: {}",
+            save_failure_reason::<FakeSdError>(&FsOpError::CleanupIncomplete(Box::new(
+                FsOpError::VerifyFailed
+            )))
+        );
+        assert_eq!(ghost, "Rename failed: partial copy left");
+        assert!(ghost.chars().count() <= 32);
+        // SourceRemains lands on the success-with-caveat path in the UI;
+        // this guards the wording if a failure banner ever shows it.
+        let source_remains = alloc::format!(
+            "Move failed: {}",
+            save_failure_reason::<FakeSdError>(&FsOpError::SourceRemains(Box::new(
+                FsOpError::VerifyFailed
+            )))
+        );
+        assert_eq!(source_remains, "Move failed: old entry remains");
+        assert!(source_remains.chars().count() <= 32);
+        // The delete prompt's non-DeleteIncomplete prefix with its longest
+        // common reason is exactly the 32-column budget.
+        let not_deleted = alloc::format!(
+            "Not deleted: {}",
+            save_failure_reason::<FakeSdError>(&FsOpError::Fs(
+                embedded_sdmmc::Error::DeleteNonEmptyDir
+            ))
+        );
+        assert_eq!(not_deleted, "Not deleted: folder is not empty");
+        assert!(not_deleted.chars().count() <= 32);
+        let read_only = alloc::format!(
+            "Not deleted: {}",
+            save_failure_reason::<FakeSdError>(&FsOpError::Fs(embedded_sdmmc::Error::ReadOnly))
+        );
+        assert_eq!(read_only, "Not deleted: file is read-only");
+        assert!(read_only.chars().count() <= 32);
     }
 
     #[test]
@@ -3187,7 +3877,10 @@ mod tests {
         fs.save_verified("/GROWN.TXT", &oversized).unwrap();
         assert!(matches!(
             fs.save_transactional("/GROWN.TXT", b"small"),
-            Err(FsOpError::TooLarge)
+            Err(SaveError {
+                error: FsOpError::TooLarge,
+                ..
+            })
         ));
         assert_eq!(fs.read_file("/GROWN.TXT").unwrap(), oversized);
         assert!(staging_leftovers(&fs).is_empty());
@@ -3214,10 +3907,15 @@ mod tests {
                 assert!(result.is_ok());
                 break;
             }
-            if matches!(result, Err(FsOpError::VerifyFailed))
-                && fs
-                    .read_file("/FILE.TXT")
-                    .is_ok_and(|bytes| bytes == original)
+            if matches!(
+                result,
+                Err(SaveError {
+                    error: FsOpError::VerifyFailed,
+                    ..
+                })
+            ) && fs
+                .read_file("/FILE.TXT")
+                .is_ok_and(|bytes| bytes == original)
                 && staging_leftovers(&fs).is_empty()
             {
                 rollback_proven = true;
@@ -3238,10 +3936,437 @@ mod tests {
         // must survive as the recovery data the doc comment promises.
         ram.fail_writes_after.set(Some(staging));
         let result = fs.save_transactional("/FILE.TXT", &new_contents);
-        assert!(result.as_ref().is_err_and(FsOpError::is_device_error));
+        let error = result.expect_err("the dead card cannot commit");
+        assert!(error.error.is_device_error());
+        // The headline of the SaveError plumbing: the caller learns the
+        // surviving backup's name so the user can be pointed at it.
+        assert_eq!(error.backup_kept.as_deref(), Some("/~WIO0000.BAK"));
         ram.fail_writes.set(false);
         assert_eq!(fs.read_file("/~WIO0000.TMP").unwrap(), new_contents);
         assert_eq!(fs.read_file("/~WIO0000.BAK").unwrap(), original);
+    }
+
+    #[test]
+    fn sd_retry_returns_first_success_and_last_failure() {
+        let calls = Cell::new(0u32);
+        let result: Result<u32, ()> = sd_retry(|| {
+            calls.set(calls.get() + 1);
+            if calls.get() < 3 {
+                Err(())
+            } else {
+                Ok(calls.get())
+            }
+        });
+        assert_eq!(result, Ok(3));
+        assert_eq!(calls.get(), 3);
+
+        calls.set(0);
+        let result: Result<(), u32> = sd_retry(|| {
+            calls.set(calls.get() + 1);
+            Err(calls.get())
+        });
+        assert_eq!(result, Err(SD_RETRY_ATTEMPTS as u32));
+        assert_eq!(calls.get(), SD_RETRY_ATTEMPTS as u32);
+
+        calls.set(0);
+        let result: Result<(), ()> = sd_retry(|| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn delete_survives_any_single_transient_write_failure() {
+        let contents = vec![0x33u8; 8192];
+        // Twin-measure a clean delete's write-call count (all calls succeed,
+        // so writes_seen counts them exactly).
+        let (ram, fs) = formatted_fs(131_072);
+        fs.save_verified("/DOOMED.TXT", &contents).unwrap();
+        let before = ram.writes_seen.get();
+        fs.delete_verified("/DOOMED.TXT", false).unwrap();
+        let delete_writes = ram.writes_seen.get() - before;
+        assert!(delete_writes > 0);
+        // One transient write failure at every position must be absorbed:
+        // the truncate step swallows its own errors and the entry delete
+        // retries under the standard policy.
+        for injected in 0..delete_writes {
+            let (ram, fs) = formatted_fs(131_072);
+            fs.save_verified("/DOOMED.TXT", &contents).unwrap();
+            ram.fail_one_write_after.set(Some(injected));
+            fs.delete_verified("/DOOMED.TXT", false)
+                .unwrap_or_else(|error| panic!("delete died at write {injected}: {error:?}"));
+            assert!(!fs.entry_exists("/DOOMED.TXT").unwrap());
+        }
+    }
+
+    #[test]
+    fn stuck_delete_after_truncate_reports_delete_incomplete() {
+        let contents = vec![0x44u8; 8192];
+        let (ram, fs) = formatted_fs(131_072);
+        fs.save_verified("/DOOMED.TXT", &contents).unwrap();
+        let before = ram.writes_seen.get();
+        fs.delete_verified("/DOOMED.TXT", false).unwrap();
+        let delete_writes = ram.writes_seen.get() - before;
+
+        // A write failure that latches at the final delete write (the
+        // directory-entry delete, after the truncate persisted) must be
+        // reported as DeleteIncomplete, not a generic failure implying the
+        // contents are intact.
+        let (ram, fs) = formatted_fs(131_072);
+        fs.save_verified("/DOOMED.TXT", &contents).unwrap();
+        ram.fail_writes_after.set(Some(delete_writes - 1));
+        let error = fs
+            .delete_verified("/DOOMED.TXT", false)
+            .expect_err("the latched card cannot finish the delete");
+        assert!(matches!(error, FsOpError::DeleteIncomplete(_)));
+        assert_eq!(save_failure_reason(&error), "data removed");
+        ram.fail_writes.set(false);
+        // The honest state: still listed, contents destroyed.
+        assert!(fs.entry_exists("/DOOMED.TXT").unwrap());
+        assert!(fs.read_file("/DOOMED.TXT").unwrap().is_empty());
+    }
+
+    #[test]
+    fn recursive_delete_reports_incomplete_after_children_destroyed() {
+        fn folder_of_four(sectors: u32) -> (RamBlocks, CardFs<RamBlocks>) {
+            let (ram, fs) = formatted_fs(sectors);
+            fs.create_directory_verified("/DIR").unwrap();
+            for i in 0..4 {
+                fs.create_empty(&alloc::format!("/DIR/F{i:02}.TXT")).unwrap();
+            }
+            (ram, fs)
+        }
+        // Twin-measure a clean folder delete's writes.
+        let (ram, fs) = folder_of_four(131_072);
+        let before = ram.writes_seen.get();
+        fs.delete_verified("/DIR", true).unwrap();
+        let folder_writes = ram.writes_seen.get() - before;
+        assert!(folder_writes >= 4, "four child deletes plus the folder's");
+
+        // A card that dies mid-way -- after some children's delete writes
+        // persisted -- must report DeleteIncomplete, never a refusal
+        // implying the folder is intact. Empty files have no clusters to
+        // reclaim, so `truncated` is false for every child: this is the
+        // FAT16-shaped path where per-file tracking alone would claim
+        // nothing was destroyed.
+        let (ram, fs) = folder_of_four(131_072);
+        ram.fail_writes_after.set(Some(folder_writes / 2));
+        let error = fs
+            .delete_verified("/DIR", true)
+            .expect_err("the latched card cannot finish the folder delete");
+        assert!(
+            matches!(error, FsOpError::DeleteIncomplete(_)),
+            "expected DeleteIncomplete, got {error:?}"
+        );
+        assert_eq!(save_failure_reason(&error), "data removed");
+        ram.fail_writes.set(false);
+        // The honest state: the folder survives with only part of its
+        // children.
+        assert!(fs.entry_exists("/DIR").unwrap());
+        let remaining = (0..4)
+            .filter(|i| fs.entry_exists(&alloc::format!("/DIR/F{i:02}.TXT")).unwrap())
+            .count();
+        assert!(remaining < 4, "at least one child was destroyed");
+        assert!(remaining > 0, "the latch stopped the delete mid-way");
+    }
+
+    #[test]
+    fn delete_never_reports_not_found_while_the_entry_exists() {
+        // The manager's directory walks discard FAT chain-read failures and
+        // fall through to NotFound, so a transient read flake during a
+        // delete can claim an existing entry is missing. 512-byte clusters
+        // (one sector per cluster on this image) hold 16 directory entries;
+        // 20 files plus the dot entries span two clusters, so deleting a
+        // file in the second cluster crosses the launder-prone chain read.
+        // Injection is scoped to delete_entry_checked via a pre-opened
+        // handle: the path-walk helpers launder independently and are out
+        // of this test's scope.
+        let build = || {
+            let (ram, fs) = formatted_fs(131_072);
+            fs.create_directory_verified("/DIR").unwrap();
+            for i in 0..20 {
+                fs.create_empty(&alloc::format!("/DIR/F{i:02}.TXT")).unwrap();
+            }
+            (ram, fs)
+        };
+
+        // Twin-measure the reads a clean scoped delete consumes.
+        let (ram, fs) = build();
+        let dir = fs.open_dir_path("/DIR").unwrap();
+        let before = ram.reads_seen.get();
+        fs.delete_entry_checked(dir, "F17.TXT", false).unwrap();
+        let clean_reads = ram.reads_seen.get() - before;
+        let _ = fs.mgr.close_dir(dir);
+        assert!(clean_reads > 0);
+
+        for injected in 0..clean_reads {
+            let (ram, fs) = build();
+            let dir = fs.open_dir_path("/DIR").unwrap();
+            ram.fail_one_read_after.set(Some(injected));
+            let result = fs.delete_entry_checked(dir, "F17.TXT", false);
+            ram.fail_one_read_after.set(None);
+            let _ = fs.mgr.close_dir(dir);
+            let exists = fs.entry_exists("/DIR/F17.TXT").unwrap();
+            match result {
+                Ok(()) => assert!(!exists, "Ok but entry survives at read {injected}"),
+                Err(error) => {
+                    assert!(exists, "error {error:?} but entry gone at read {injected}");
+                    assert!(
+                        !matches!(error, FsOpError::Fs(embedded_sdmmc::Error::NotFound)),
+                        "laundered NotFound surfaced at read {injected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn confirmed_absence_after_truncate_reports_delete_incomplete() {
+        // The double-laundered residue: after the truncate persisted, a FAT
+        // region that stops answering makes the delete's directory walk
+        // launder its chain-step read into NotFound, and the confirming
+        // walk launders identically against the same dead sectors. The
+        // entry provably existed moments ago (the truncate opened it), so
+        // the honest report is DeleteIncomplete -- never "file not found"
+        // for a listed, emptied entry.
+        let (ram, fs) = formatted_fs(131_072);
+        fs.create_directory_verified("/DIR").unwrap();
+        for i in 0..20 {
+            fs.create_empty(&alloc::format!("/DIR/F{i:02}.TXT")).unwrap();
+        }
+        // Four clusters of content, and an entry in the directory's second
+        // cluster so lookups must step the FAT chain.
+        fs.save_verified("/DIR/F17.TXT", &[0x11u8; 2048]).unwrap();
+
+        let dir = fs.open_dir_path("/DIR").unwrap();
+        assert!(fs.reclaim_file_clusters_in_dir(dir, "F17.TXT"));
+        // The truncate may have left its blocks cached; the failure must
+        // come from the card, not be masked by an echo.
+        fs.drop_block_cache();
+        let geometry = fat32_geometry(131_072, 0).unwrap();
+        let fat_start = geometry.partition_start + 32;
+        ram.fail_reads_in
+            .set(Some((fat_start, fat_start + 2 * geometry.fat_sectors)));
+        let error = fs
+            .delete_entry_checked(dir, "F17.TXT", true)
+            .expect_err("the dead FAT region cannot confirm the delete");
+        ram.fail_reads_in.set(None);
+        let _ = fs.mgr.close_dir(dir);
+        assert!(
+            matches!(error, FsOpError::DeleteIncomplete(_)),
+            "expected DeleteIncomplete, got {error:?}"
+        );
+        assert_eq!(save_failure_reason(&error), "data removed");
+        // The honest state: still listed, contents destroyed.
+        assert!(fs.entry_exists("/DIR/F17.TXT").unwrap());
+        assert!(fs.read_file("/DIR/F17.TXT").unwrap().is_empty());
+    }
+
+    #[test]
+    fn move_reports_source_ghost_when_its_delete_sticks() {
+        let contents = vec![0x77u8; 8192];
+        let (ram, fs) = formatted_fs(131_072);
+        fs.save_verified("/SRC.TXT", &contents).unwrap();
+        let before = ram.writes_seen.get();
+        fs.move_entry_verified("/SRC.TXT", "/DST.TXT").unwrap();
+        let move_writes = ram.writes_seen.get() - before;
+
+        // The move's final write is the source's directory-entry delete; a
+        // failure latching there leaves a verified destination plus an
+        // emptied source ghost, and the caller must hear that -- "Move
+        // failed" would invite deleting the only good copy.
+        let (ram, fs) = formatted_fs(131_072);
+        fs.save_verified("/SRC.TXT", &contents).unwrap();
+        ram.fail_writes_after.set(Some(move_writes - 1));
+        let error = fs
+            .move_entry_verified("/SRC.TXT", "/DST.TXT")
+            .expect_err("the latched card cannot finish the move");
+        assert!(matches!(error, FsOpError::DeleteIncomplete(_)));
+        ram.fail_writes.set(false);
+        assert_eq!(fs.read_file("/DST.TXT").unwrap(), contents);
+        assert!(fs.entry_exists("/SRC.TXT").unwrap());
+        assert!(fs.read_file("/SRC.TXT").unwrap().is_empty());
+    }
+
+    #[test]
+    fn fat16_move_source_delete_failure_reports_source_remains() {
+        // FAT16 never truncates before a delete (reclaim is FAT32-only), so
+        // DeleteIncomplete is unreachable there: a stuck source delete after
+        // a fully verified copy must still surface as success-with-caveat
+        // (SourceRemains), not a raw "Move failed" that invites deleting
+        // the only good copy -- with the retry then dead-ending at
+        // "already exists".
+        let contents = vec![0x77u8; 2048];
+        let (ram, layout) = fat16_media();
+        let fs = CardFs::mount(ram.clone(), layout).unwrap();
+        fs.save_verified("/SRC.TXT", &contents).unwrap();
+        let before = ram.writes_seen.get();
+        fs.move_entry_verified("/SRC.TXT", "/DST.TXT").unwrap();
+        let move_writes = ram.writes_seen.get() - before;
+
+        // Twin fixture with the identical write history: latch the failure
+        // at the move's final write, the source's directory-entry delete.
+        let (ram, layout) = fat16_media();
+        let fs = CardFs::mount(ram.clone(), layout).unwrap();
+        fs.save_verified("/SRC.TXT", &contents).unwrap();
+        ram.fail_writes_after.set(Some(move_writes - 1));
+        let error = fs
+            .move_entry_verified("/SRC.TXT", "/DST.TXT")
+            .expect_err("the latched card cannot finish the move");
+        assert!(
+            matches!(error, FsOpError::SourceRemains(_)),
+            "expected SourceRemains, got {error:?}"
+        );
+        assert_eq!(save_failure_reason(&error), "old entry remains");
+        ram.fail_writes.set(false);
+        // The truth SourceRemains reports: destination verified, source
+        // still intact (no truncate ran).
+        assert_eq!(fs.read_file("/DST.TXT").unwrap(), contents);
+        assert_eq!(fs.read_file("/SRC.TXT").unwrap(), contents);
+        // Without the caveat report, the user's retry would hit this
+        // unexplained dead end.
+        assert!(matches!(
+            fs.move_entry_verified("/SRC.TXT", "/DST.TXT"),
+            Err(FsOpError::AlreadyExists)
+        ));
+    }
+
+    #[test]
+    fn masked_extension_fault_reports_card_fault_and_preserves_staging() {
+        let original = vec![0x55u8; 8192];
+        let new_contents = vec![0xaau8; 8192];
+        let staging = staging_write_count(&new_contents, &original);
+        // Sweep total card death across every write of the commit step. The
+        // manager masks device faults met while extending the target's
+        // cluster chain as DiskFull; the save must never report a dead card
+        // as "storage is full", and must leave the staging copies in place.
+        let mut saw_unresponsive = false;
+        let mut control_run_seen = false;
+        for extra in 0..10_000u32 {
+            let (ram, fs) = formatted_fs(131_072);
+            fs.save_verified("/FILE.TXT", &original).unwrap();
+            ram.die_after_writes.set(Some(staging + extra));
+            let result = fs.save_transactional("/FILE.TXT", &new_contents);
+            let died = ram.die_after_writes.get().is_none();
+            ram.fail_writes.set(false);
+            ram.fail_reads.set(false);
+            if !died {
+                // The death point fell beyond the whole operation.
+                assert!(result.is_ok());
+                control_run_seen = true;
+                break;
+            }
+            let Err(error) = result else {
+                // Death landed in the post-commit staging cleanup, which is
+                // deliberately swallowed; the save itself already won.
+                continue;
+            };
+            assert_ne!(
+                save_failure_reason(&error.error),
+                "storage is full",
+                "dead card misread as full at commit write {extra}"
+            );
+            if matches!(error.error, FsOpError::DeviceUnresponsive) {
+                saw_unresponsive = true;
+            }
+            // No rollback ran through the dead card: both staging copies
+            // survive as the recovery data, and the caller is told about
+            // the backup.
+            assert!(error.backup_kept.is_some());
+            assert_eq!(fs.read_file("/~WIO0000.TMP").unwrap(), new_contents);
+            assert_eq!(fs.read_file("/~WIO0000.BAK").unwrap(), original);
+        }
+        assert!(control_run_seen);
+        assert!(
+            saw_unresponsive,
+            "no death point exercised the DiskFull mask"
+        );
+    }
+
+    #[test]
+    fn genuine_disk_full_rolls_back_and_reports_full() {
+        // FAT16: the manager keeps no free-cluster counter there, so a
+        // genuine exhaustion surfaces cleanly. (Exhausting FAT32 trips the
+        // manager's own FSInfo counter underflow in debug builds.)
+        let (ram, layout) = fat16_media();
+        let fs = CardFs::mount(ram.clone(), layout).unwrap();
+        let free = fs.free_space_bytes().unwrap();
+        // Fill the card down to eight clusters, then ask a save to stage a
+        // document that cannot fit: a genuinely full, healthy card must keep
+        // the honest "storage is full" report and roll its staging back.
+        let filler = vec![0x11u8; (free - 8 * 512) as usize];
+        fs.save_verified("/FILLER.BIN", &filler).unwrap();
+        fs.save_verified("/FILE.TXT", b"small").unwrap();
+        let error = fs
+            .save_transactional("/FILE.TXT", &vec![0x22u8; 16 * 1024])
+            .expect_err("the full card cannot stage the new contents");
+        assert!(
+            matches!(
+                error.error,
+                FsOpError::Fs(embedded_sdmmc::Error::DiskFull | embedded_sdmmc::Error::NotEnoughSpace)
+            ),
+            "expected a full-disk report, got {error:?}"
+        );
+        assert_eq!(save_failure_reason(&error.error), "storage is full");
+        // The failure hit the staging stage, before any backup existed.
+        assert!(error.backup_kept.is_none());
+        assert!(staging_leftovers(&fs).is_empty());
+        assert_eq!(fs.read_file("/FILE.TXT").unwrap(), b"small");
+    }
+
+    #[test]
+    fn move_into_high_byte_folder_does_not_panic() {
+        let (_ram, fs) = formatted_fs(131_072);
+        // "É" (U+00C9) is a storable 8.3 byte that Display re-renders as two
+        // UTF-8 bytes; "/AB".len() == 3 lands inside it in "/XÉ/AB", which a
+        // str slice in path_is_inside panicked on.
+        fs.create_directory_verified("/X\u{c9}").unwrap();
+        fs.create_directory_verified("/AB").unwrap();
+        fs.move_entry_verified("/AB", "/X\u{c9}/AB").unwrap();
+        assert!(fs.entry_exists("/X\u{c9}/AB").unwrap());
+        assert!(!fs.entry_exists("/AB").unwrap());
+    }
+
+    #[test]
+    fn probe_and_mount_agree_on_mbr_slot_acceptance() {
+        // probe_fat mirrors embedded-sdmmc's private MBR status mask and
+        // partition-type accept list; a slot the probe accepts but the mount
+        // refuses would dead-end a good card at the format prompt. Prove the
+        // two layers agree over one valid FAT32 image with every status and
+        // type combination patched into slot 0.
+        let sectors = 131_072u32;
+        let ram = RamBlocks::new(sectors);
+        format_fat32(&mut SdStream::new(ram.clone()).unwrap(), sectors, 0).unwrap();
+        let statuses = [0x00u8, 0x80, 0x01, 0x7f, 0xff];
+        // Derived from the real accept lists so a constant gaining an entry
+        // is automatically exercised here; only the unknown types are local.
+        let kinds: Vec<u8> = MOUNTABLE_PARTITION_TYPES
+            .into_iter()
+            .chain(KNOWN_UNSUPPORTED_PARTITION_TYPES)
+            .chain([0x00, 0x83])
+            .collect();
+        for status in statuses {
+            for &kind in &kinds {
+                {
+                    let mut blocks = ram.blocks.borrow_mut();
+                    blocks[0].contents[446] = status;
+                    blocks[0].contents[446 + 4] = kind;
+                }
+                let probed = probe_fat(&mut SdStream::new(ram.clone()).unwrap(), sectors);
+                let mounted = VolumeManager::new(ram.clone(), FixedTimeSource)
+                    .open_raw_volume(VolumeIdx(0));
+                assert_eq!(
+                    probed.is_ok(),
+                    mounted.is_ok(),
+                    "probe/mount disagree for status {status:#04x} kind {kind:#04x}"
+                );
+                if let Ok(layout) = probed {
+                    assert_eq!(layout.partition_index, 0);
+                }
+            }
+        }
     }
 
     /// The on-disk 11-byte form of an 8.3 name (blank-padded, uppercase).
@@ -3300,7 +4425,10 @@ mod tests {
         // writable.
         assert!(matches!(
             fs.save_transactional("/ROFILE.TXT", b"overwrite"),
-            Err(FsOpError::Fs(embedded_sdmmc::Error::ReadOnly))
+            Err(SaveError {
+                error: FsOpError::Fs(embedded_sdmmc::Error::ReadOnly),
+                ..
+            })
         ));
         assert!(matches!(
             fs.delete_verified("/ROFILE.TXT", false),
@@ -3329,6 +4457,313 @@ mod tests {
             b"deep protected"
         );
         assert!(!fs.entry_exists("/MOVED").unwrap());
+    }
+
+    #[test]
+    fn save_confirms_target_presence_before_destroying_it() {
+        // One laundered NotFound during save_transactional's existence
+        // check must not skip the pre-checks and the backup staging: with
+        // existed=false the in-place rewrite would meet the read-only
+        // refusal only at the commit, and the !existed rollback would then
+        // delete the protected original (delete_entry_in_dir never checks
+        // the read-only bit) -- the only copy, with no backup kept.
+        let build = || {
+            let (ram, fs) = formatted_fs(131_072);
+            fs.create_directory_verified("/DIR").unwrap();
+            for i in 0..20 {
+                fs.create_empty(&alloc::format!("/DIR/F{i:02}.TXT")).unwrap();
+            }
+            fs.save_verified("/DIR/F17.TXT", b"protected contents")
+                .unwrap();
+            drop(fs);
+            patch_read_only(&ram, "F17.TXT");
+            let layout = probe_fat(&mut SdStream::new(ram.clone()).unwrap(), 131_072).unwrap();
+            let fs = CardFs::mount(ram.clone(), layout).unwrap();
+            (ram, fs)
+        };
+
+        // Twin-measure the reads the existence lookup consumes.
+        let (ram, fs) = build();
+        let before = ram.reads_seen.get();
+        fs.find_entry("/DIR/F17.TXT").unwrap();
+        let lookup_reads = ram.reads_seen.get() - before;
+        assert!(lookup_reads > 0);
+
+        for injected in 0..lookup_reads {
+            let (ram, fs) = build();
+            ram.fail_one_read_after.set(Some(injected));
+            let result = fs.save_transactional("/DIR/F17.TXT", b"overwrite");
+            ram.fail_one_read_after.set(None);
+            assert!(result.is_err(), "save must not succeed at read {injected}");
+            assert!(
+                fs.entry_exists("/DIR/F17.TXT").unwrap(),
+                "original entry lost at read {injected}"
+            );
+            assert_eq!(
+                fs.read_file("/DIR/F17.TXT").unwrap(),
+                b"protected contents",
+                "original contents lost at read {injected}"
+            );
+        }
+    }
+
+    #[test]
+    fn save_confirms_staging_name_before_reuse() {
+        // The staging-name scan acts destructively on absence too: a
+        // laundered NotFound on an existing ~WIO0000.TMP would reuse the
+        // suffix, and save_verified's CreateOrTruncate open would destroy a
+        // prior failed save's only proven copy of the new contents.
+        let build = || {
+            let (ram, fs) = formatted_fs(131_072);
+            fs.create_directory_verified("/DIR").unwrap();
+            for i in 0..20 {
+                fs.create_empty(&alloc::format!("/DIR/F{i:02}.TXT")).unwrap();
+            }
+            fs.save_verified("/DIR/F05.TXT", b"old contents").unwrap();
+            fs.save_verified("/DIR/~WIO0000.TMP", b"precious recovery data")
+                .unwrap();
+            (ram, fs)
+        };
+
+        // Twin-measure the pre-staging lookup window: target existence,
+        // the occupied suffix, and the free suffix the scan settles on.
+        let (ram, fs) = build();
+        let before = ram.reads_seen.get();
+        fs.find_entry("/DIR/F05.TXT").unwrap();
+        assert!(fs.entry_exists("/DIR/~WIO0000.TMP").unwrap());
+        assert!(!fs.entry_exists("/DIR/~WIO0001.TMP").unwrap());
+        assert!(!fs.entry_exists("/DIR/~WIO0001.BAK").unwrap());
+        let lookup_reads = ram.reads_seen.get() - before;
+        assert!(lookup_reads > 0);
+
+        for injected in 0..lookup_reads {
+            let (ram, fs) = build();
+            ram.fail_one_read_after.set(Some(injected));
+            let _ = fs.save_transactional("/DIR/F05.TXT", b"new contents");
+            ram.fail_one_read_after.set(None);
+            assert_eq!(
+                fs.read_file("/DIR/~WIO0000.TMP").unwrap(),
+                b"precious recovery data",
+                "staged recovery data destroyed at read {injected}"
+            );
+        }
+    }
+
+    #[test]
+    fn move_confirms_destination_before_clobbering_it() {
+        // A laundered NotFound on the move's destination pre-check lets the
+        // copy run; the copy then fails AlreadyExists, and its rollback
+        // would delete the *pre-existing* destination file.
+        let build = || {
+            let (ram, fs) = formatted_fs(131_072);
+            fs.create_directory_verified("/DIR").unwrap();
+            for i in 0..20 {
+                fs.create_empty(&alloc::format!("/DIR/F{i:02}.TXT")).unwrap();
+            }
+            fs.save_verified("/DIR/F17.TXT", b"existing destination")
+                .unwrap();
+            fs.save_verified("/SRC.TXT", b"source data").unwrap();
+            (ram, fs)
+        };
+
+        // Twin-measure the two pre-check lookups.
+        let (ram, fs) = build();
+        let before = ram.reads_seen.get();
+        fs.find_entry("/SRC.TXT").unwrap();
+        fs.find_entry("/DIR/F17.TXT").unwrap();
+        let lookup_reads = ram.reads_seen.get() - before;
+        assert!(lookup_reads > 0);
+
+        for injected in 0..lookup_reads {
+            let (ram, fs) = build();
+            ram.fail_one_read_after.set(Some(injected));
+            let result = fs.move_entry_verified("/SRC.TXT", "/DIR/F17.TXT");
+            ram.fail_one_read_after.set(None);
+            assert!(result.is_err(), "move must not succeed at read {injected}");
+            assert_eq!(
+                fs.read_file("/DIR/F17.TXT").unwrap(),
+                b"existing destination",
+                "destination clobbered at read {injected}"
+            );
+            assert_eq!(
+                fs.read_file("/SRC.TXT").unwrap(),
+                b"source data",
+                "source damaged at read {injected}"
+            );
+        }
+    }
+
+    #[test]
+    fn move_verify_flake_never_fails_a_landed_move() {
+        // Once the copy is verified and the source delete confirmed, a
+        // transient read during the post-move verification must never turn
+        // the landed move into a reported failure -- "file not found" for
+        // a move that succeeded invites deleting the only good copy.
+        let build = || {
+            let (ram, fs) = formatted_fs(131_072);
+            fs.create_directory_verified("/DIR").unwrap();
+            fs.save_verified("/SRC.TXT", b"source data").unwrap();
+            (ram, fs)
+        };
+        // Twin-measure a clean move's reads.
+        let (ram, fs) = build();
+        let before = ram.reads_seen.get();
+        fs.move_entry_verified("/SRC.TXT", "/DIR/DST.TXT").unwrap();
+        let move_reads = ram.reads_seen.get() - before;
+        assert!(move_reads > 0);
+
+        for injected in 0..move_reads {
+            let (ram, fs) = build();
+            ram.fail_one_read_after.set(Some(injected));
+            let result = fs.move_entry_verified("/SRC.TXT", "/DIR/DST.TXT");
+            ram.fail_one_read_after.set(None);
+            assert!(
+                !matches!(result, Err(FsOpError::Fs(embedded_sdmmc::Error::NotFound))),
+                "move reported 'file not found' at read {injected}"
+            );
+            let landed = fs
+                .read_file("/DIR/DST.TXT")
+                .map(|data| data == b"source data")
+                .unwrap_or(false)
+                && !fs.entry_exists("/SRC.TXT").unwrap();
+            if landed {
+                assert!(
+                    result.is_ok(),
+                    "landed move reported {result:?} at read {injected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn delete_verify_flake_never_reports_not_deleted() {
+        // Once delete_entry_checked has confirmed the removal, a transient
+        // read during delete_verified's advisory re-check must not convert
+        // the completed delete into a "Not deleted" report.
+        let contents = vec![0x55u8; 4096];
+        let (ram, fs) = formatted_fs(131_072);
+        fs.save_verified("/DOOMED.TXT", &contents).unwrap();
+        let before = ram.reads_seen.get();
+        fs.delete_verified("/DOOMED.TXT", false).unwrap();
+        let delete_reads = ram.reads_seen.get() - before;
+        assert!(delete_reads > 0);
+
+        for injected in 0..delete_reads {
+            let (ram, fs) = formatted_fs(131_072);
+            fs.save_verified("/DOOMED.TXT", &contents).unwrap();
+            ram.fail_one_read_after.set(Some(injected));
+            let result = fs.delete_verified("/DOOMED.TXT", false);
+            ram.fail_one_read_after.set(None);
+            if !fs.entry_exists("/DOOMED.TXT").unwrap() {
+                assert!(
+                    result.is_ok(),
+                    "completed delete reported {result:?} at read {injected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn format_marks_phantom_fat_tail_entries_bad() {
+        // The manager's free-cluster search scans whole FAT sectors without
+        // re-checking its end bound, so zeroed spare entries in the FAT's
+        // last sector would be handed out as allocatable clusters mapping
+        // past the end of the partition once the card fills up.
+        let sectors = 131_072u32;
+        let ram = RamBlocks::new(sectors);
+        let geometry =
+            format_fat32(&mut SdStream::new(ram.clone()).unwrap(), sectors, 0).unwrap();
+        let phantom_offset = ((geometry.cluster_count + 2) as usize * 4) % 512;
+        assert_ne!(phantom_offset, 0, "fixture must have a phantom tail");
+
+        let first_fat = geometry.partition_start + 32;
+        let blocks = ram.blocks.borrow();
+        for copy in 0..2u32 {
+            let last = (first_fat + (copy + 1) * geometry.fat_sectors - 1) as usize;
+            let contents = &blocks[last].contents;
+            assert!(
+                contents[..phantom_offset].iter().all(|byte| *byte == 0),
+                "FAT copy {copy}: real entries below the tail must stay free"
+            );
+            for entry in contents[phantom_offset..].chunks_exact(4) {
+                assert_eq!(
+                    entry,
+                    [0xf7, 0xff, 0xff, 0x0f],
+                    "FAT copy {copy}: phantom tail entry not marked bad"
+                );
+            }
+        }
+        drop(blocks);
+
+        // The volume still mounts and reports the FSInfo figure, which
+        // never counted the phantoms.
+        let layout = probe_fat(&mut SdStream::new(ram.clone()).unwrap(), sectors).unwrap();
+        let fs = CardFs::mount(ram.clone(), layout).unwrap();
+        assert_eq!(
+            fs.free_space_bytes(),
+            Some(
+                u64::from(geometry.cluster_count - 1)
+                    * u64::from(geometry.sectors_per_cluster)
+                    * 512
+            )
+        );
+    }
+
+    #[test]
+    fn mount_repairs_zeroed_phantom_fat_tail() {
+        // Foreign formatters commonly leave the FAT tail zeroed, exposing
+        // the same phantom-cluster hazard the formatter guards against;
+        // mount must apply the same bad-cluster marks.
+        let sectors = 131_072u32;
+        let ram = RamBlocks::new(sectors);
+        let geometry =
+            format_fat32(&mut SdStream::new(ram.clone()).unwrap(), sectors, 0).unwrap();
+        let phantom_offset = ((geometry.cluster_count + 2) as usize * 4) % 512;
+        assert_ne!(phantom_offset, 0, "fixture must have a phantom tail");
+
+        // Simulate the foreign card: zero the tail entries of both copies.
+        let first_fat = geometry.partition_start + 32;
+        let tail_sectors: [usize; 2] = core::array::from_fn(|copy| {
+            (first_fat + (copy as u32 + 1) * geometry.fat_sectors - 1) as usize
+        });
+        {
+            let mut blocks = ram.blocks.borrow_mut();
+            for last in tail_sectors {
+                blocks[last].contents[phantom_offset..].fill(0);
+            }
+        }
+
+        let layout = probe_fat(&mut SdStream::new(ram.clone()).unwrap(), sectors).unwrap();
+        let _fs = CardFs::mount(ram.clone(), layout).unwrap();
+
+        let blocks = ram.blocks.borrow();
+        for (copy, last) in tail_sectors.into_iter().enumerate() {
+            let contents = &blocks[last].contents;
+            assert!(
+                contents[..phantom_offset].iter().all(|byte| *byte == 0),
+                "FAT copy {copy}: real entries below the tail must stay free"
+            );
+            for entry in contents[phantom_offset..].chunks_exact(4) {
+                assert_eq!(
+                    entry,
+                    [0xf7, 0xff, 0xff, 0x0f],
+                    "FAT copy {copy}: phantom tail entry not re-marked at mount"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mount_writes_nothing_to_a_healthy_fat() {
+        // A card whose phantom tail is already marked (any card this
+        // firmware formatted) must mount without a single write.
+        let sectors = 131_072u32;
+        let ram = RamBlocks::new(sectors);
+        format_fat32(&mut SdStream::new(ram.clone()).unwrap(), sectors, 0).unwrap();
+        let layout = probe_fat(&mut SdStream::new(ram.clone()).unwrap(), sectors).unwrap();
+        let before = ram.writes_seen.get();
+        let _fs = CardFs::mount(ram.clone(), layout).unwrap();
+        assert_eq!(ram.writes_seen.get(), before, "mount must not write");
     }
 
     #[test]
@@ -3376,12 +4811,15 @@ mod tests {
         }
         assert!(cleaned >= 4, "only {cleaned} failures rolled back cleanly");
 
-        // Companion: a card that dies and stays dead. Not every fail point
-        // surfaces as a device error (the manager reports hard failures
-        // during cluster allocation as DiskFull), so scan for the first one
-        // that does -- it lies in the copy phase, before any source
-        // deletion -- and prove the move stopped with the source intact
-        // instead of mutating further through a dead card.
+        // Companion: a card whose writes die and stay dead. Not every fail
+        // point surfaces as a device error (the manager reports hard
+        // failures during cluster allocation as DiskFull; reads stay alive
+        // here, so assess_failure's probe passes and those points keep
+        // rollback enabled -- its failure then surfaces as
+        // CleanupIncomplete rather than being swallowed), so scan for
+        // the first one that does -- it lies in the copy phase, before any
+        // source deletion -- and prove the move stopped with the source
+        // intact instead of mutating further through a dead card.
         let mut device_error_proven = false;
         for injected in 0..move_writes {
             let (ram, fs) = build();
@@ -3396,6 +4834,52 @@ mod tests {
             }
         }
         assert!(device_error_proven);
+    }
+
+    #[test]
+    fn stuck_rollback_surfaces_cleanup_incomplete() {
+        let contents = vec![0x5au8; 4096];
+        let build = || {
+            let (ram, fs) = formatted_fs(131_072);
+            fs.save_verified("/SRC.TXT", &contents).unwrap();
+            (ram, fs)
+        };
+        let (ram, fs) = build();
+        let before = ram.writes_seen.get();
+        fs.move_entry_verified("/SRC.TXT", "/DST.TXT").unwrap();
+        let move_writes = ram.writes_seen.get() - before;
+
+        // Corrupt one write (a non-device failure that keeps rollback
+        // enabled), then latch every later write dead: the rollback delete
+        // of the partial destination cannot finish, and the ghost it leaves
+        // must be reported instead of swallowed. Scan for the first
+        // injection point that lands this way -- a hit on copied data fails
+        // the copy verification with reads still alive.
+        let mut proven = false;
+        for injected in 0..move_writes {
+            let (ram, fs) = build();
+            ram.corrupt_one_write_after.set(Some(injected));
+            ram.fail_writes_after.set(Some(injected + 1));
+            let result = fs.move_entry_verified("/SRC.TXT", "/DST.TXT");
+            ram.corrupt_one_write_after.set(None);
+            ram.fail_writes_after.set(None);
+            ram.fail_writes.set(false);
+            if let Err(error @ FsOpError::CleanupIncomplete(_)) = result {
+                assert_eq!(save_failure_reason(&error), "partial copy left");
+                // The honest state: destination ghost listed, source intact.
+                assert!(fs.entry_exists("/DST.TXT").unwrap());
+                assert_eq!(fs.read_file("/SRC.TXT").unwrap(), contents);
+                // The ghost blocks a retry until the user deletes it --
+                // exactly what the error message warns about.
+                assert!(matches!(
+                    fs.move_entry_verified("/SRC.TXT", "/DST.TXT"),
+                    Err(FsOpError::AlreadyExists)
+                ));
+                proven = true;
+                break;
+            }
+        }
+        assert!(proven, "no injection point produced CleanupIncomplete");
     }
 
     #[test]
@@ -3543,25 +5027,42 @@ mod tests {
         let ram = RamBlocks::new(sectors);
         let geometry = format_fat32(&mut SdStream::new(ram.clone()).unwrap(), sectors, 0).unwrap();
         let layout = probe_fat(&mut SdStream::new(ram.clone()).unwrap(), sectors).unwrap();
-        let fs = CardFs::mount(ram.clone(), layout).unwrap();
+        // Transient flakes are the device layer's job now, so this test
+        // mounts through RetryBlocks to mirror the firmware's controller
+        // device.
+        let fs = CardFs::mount(RetryBlocks(ram.clone()), layout).unwrap();
         let expected = u64::from(geometry.cluster_count - 1)
             * u64::from(geometry.sectors_per_cluster)
             * 512;
 
         // One transient miss per sector: real cards flake on single reads,
-        // which is why every other raw-read path retries.
+        // which the device layer retries.
         ram.fail_next_reads.set(1);
         assert_eq!(fs.free_space_bytes(), Some(expected));
 
         // A card that stops responding entirely reports unknown instead of
-        // a stale or invented figure, and recovers on a later query. The
-        // measurement was cached above, so mark it stale the way any
-        // mutation would.
-        fs.free_space_stale.set(true);
+        // a stale or invented figure. The measurement was cached above, so
+        // mark it stale the way any mutation would. The failed flush closed
+        // the volume and the reopen failed too: the handle is now dead.
+        fs.mark_free_space_stale();
         ram.fail_next_reads.set(u32::MAX);
         assert_eq!(fs.free_space_bytes(), None);
+        // Still dead: each query retries only the reopen, and the card is
+        // still not answering (3 device attempts = one logical read through
+        // RetryBlocks).
+        ram.fail_next_reads.set(3);
+        assert_eq!(fs.free_space_bytes(), None);
+        // Card recovered: the very next query repairs the handle,
+        // re-flushes, and re-measures -- browsing self-heals without
+        // waiting for a mutation or a reseat. (The FlushFailed
+        // wait-for-a-mutation latch only arises when the close itself is
+        // refused via VolumeStillInUse, which no host fixture can produce
+        // since every operation closes its handles.)
         ram.fail_next_reads.set(0);
         assert_eq!(fs.free_space_bytes(), Some(expected));
+        // The repaired handle really works.
+        fs.save_verified("/HEAL.TXT", b"alive").unwrap();
+        assert_eq!(fs.read_file("/HEAL.TXT").unwrap(), b"alive");
     }
 
     #[test]
@@ -3613,6 +5114,19 @@ mod tests {
             for copy in 0..2u32 {
                 blocks[(START + RESERVED + copy * FAT_SECTORS) as usize].contents[0..4]
                     .copy_from_slice(&[0xf8, 0xff, 0xff, 0xff]);
+            }
+            // The FAT's last sector has spare entries beyond the volume's
+            // real clusters. The manager's free-cluster search scans whole
+            // FAT sectors without re-checking its end bound, so zeroed
+            // spares would be handed out as allocatable clusters that map
+            // past the end of the media; mark them bad, as a real formatter
+            // does.
+            let first_phantom = ((CLUSTERS + 2) * 2 % 512) as usize;
+            for copy in 0..2u32 {
+                let last_fat = (START + RESERVED + (copy + 1) * FAT_SECTORS - 1) as usize;
+                for entry in blocks[last_fat].contents[first_phantom..].chunks_exact_mut(2) {
+                    entry.copy_from_slice(&[0xf7, 0xff]);
+                }
             }
         }
         let layout = probe_fat(&mut SdStream::new(ram.clone()).unwrap(), START + total).unwrap();

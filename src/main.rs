@@ -15,7 +15,7 @@ mod firmware {
     use alloc::rc::Rc;
     use alloc::string::String;
     use alloc::vec::Vec;
-    use core::cell::RefCell;
+    use core::cell::{Cell, RefCell};
     use core::fmt::Write as _;
     use core::mem;
 
@@ -44,10 +44,10 @@ mod firmware {
 
     use wio_terminal_sd_editor::{
         format_fat32, is_txt_file, join_path, leaf_name, parent_path, probe_fat,
-        save_failure_reason, validate_entry_name, validate_file_stem, Button, CardFs,
+        save_failure_reason, sd_retry, validate_entry_name, validate_file_stem, Button, CardFs,
         DirectoryItem, EditError, FsOpError, InputEngine, Key, Keyboard, ProbeError,
         RawButtons, SdStream, TextBuffer, EXPLORER_PAGE_ROWS, MAX_DOCUMENT_BYTES,
-        MAX_ENTRY_NAME_CHARS, MAX_FILE_STEM_CHARS,
+        MAX_ENTRY_NAME_CHARS, MAX_FILE_STEM_CHARS, OLD_ENTRY_REMAINS, SD_RETRY_ATTEMPTS,
     };
 
     const HEAP_SIZE: usize = 112 * 1024;
@@ -161,13 +161,67 @@ mod firmware {
     type Controller = embedded_sdmmc::SdCard<SelectedSdDevice, Delay>;
 
     #[derive(Clone)]
-    struct ControllerDevice(Rc<RefCell<Controller>>);
+    struct ControllerDevice {
+        controller: Rc<RefCell<Controller>>,
+        /// Latched when a full retry cycle (attempts plus recoveries) ends
+        /// in failure: the card is almost certainly gone or dead, and
+        /// paying three attempts plus two lazy ~400 kHz re-inits per block
+        /// would freeze the event loop for minutes during a directory
+        /// walk. While set, each operation makes ONE bare attempt (no
+        /// retries, no recovery) and any success clears the latch. Shared
+        /// across clones; card-detect remounts build fresh devices, which
+        /// is what resets it for a new card.
+        dead: Rc<Cell<bool>>,
+    }
 
     impl ControllerDevice {
+        fn new(controller: Rc<RefCell<Controller>>) -> Self {
+            Self {
+                controller,
+                dead: Rc::new(Cell::new(false)),
+            }
+        }
+
         fn recover_card(&self) {
-            let controller = self.0.borrow();
+            let controller = self.controller.borrow();
             let _ = controller.spi(|device| device.prepare_card());
             controller.mark_card_uninit();
+        }
+
+        // Single SPI exchanges flake on real cards, so every access gets
+        // the standard retry policy. Recovery between attempts re-preps
+        // and re-initializes the card, which is what lets the next attempt
+        // succeed; a card that survives a whole cycle of that is declared
+        // dead (see the `dead` field) instead of being recovered one last
+        // time, so the next operation fails fast.
+        fn run<T>(
+            &self,
+            mut op: impl FnMut(&Controller) -> Result<T, embedded_sdmmc::SdCardError>,
+        ) -> Result<T, embedded_sdmmc::SdCardError> {
+            if self.dead.get() {
+                let result = op(&self.controller.borrow());
+                if result.is_ok() {
+                    self.dead.set(false);
+                }
+                return result;
+            }
+            let mut attempt = 0usize;
+            let result = sd_retry(|| {
+                attempt += 1;
+                let result = op(&self.controller.borrow());
+                // Recover only *between* attempts: after the final failure
+                // the card is declared dead and must fail fast, not be left
+                // marked-uninit to pay a full slow-clock lazy re-init on
+                // every bare attempt while the latch holds.
+                if result.is_err() && attempt < SD_RETRY_ATTEMPTS {
+                    self.recover_card();
+                }
+                result
+            });
+            if result.is_err() {
+                self.dead.set(true);
+            }
+            result
         }
     }
 
@@ -175,38 +229,32 @@ mod firmware {
         type Error = embedded_sdmmc::SdCardError;
 
         fn read(&self, blocks: &mut [Block], start: BlockIdx) -> Result<(), Self::Error> {
-            let result = self.0.borrow().read(blocks, start);
-            if result.is_err() {
-                self.recover_card();
-            }
-            result
+            self.run(|controller| controller.read(blocks, start))
         }
 
         fn write(&self, blocks: &[Block], start: BlockIdx) -> Result<(), Self::Error> {
-            let result = self.0.borrow().write(blocks, start);
-            // Some cards return a late status error after accepting the data.
-            // SdStream issues one block at a time, so verify that block before
-            // resetting and repeating an operation that may already have won.
-            if result.is_err() && blocks.len() == 1 {
-                let mut actual = Block::new();
-                if self
-                    .0
-                    .borrow()
-                    .read(core::slice::from_mut(&mut actual), start)
-                    .is_ok()
-                    && actual.contents == blocks[0].contents
-                {
-                    return Ok(());
+            self.run(|controller| {
+                let result = controller.write(blocks, start);
+                // Some cards return a late status error after accepting the
+                // data. The filesystem issues one block at a time, so verify
+                // that block before resetting and repeating an operation that
+                // may already have won.
+                if result.is_err() && blocks.len() == 1 {
+                    let mut actual = Block::new();
+                    if controller
+                        .read(core::slice::from_mut(&mut actual), start)
+                        .is_ok()
+                        && actual.contents == blocks[0].contents
+                    {
+                        return Ok(());
+                    }
                 }
-            }
-            if result.is_err() {
-                self.recover_card();
-            }
-            result
+                result
+            })
         }
 
         fn num_blocks(&self) -> Result<BlockCount, Self::Error> {
-            self.0.borrow().num_blocks()
+            self.run(|controller| controller.num_blocks())
         }
     }
 
@@ -451,6 +499,35 @@ mod firmware {
         }
     }
 
+    /// A copy-based filesystem operation slow enough to warrant a blocking
+    /// "working" notice: `handle_button` returns it as [`HandleResult::Op`],
+    /// and the event loop paints the notice before running it synchronously
+    /// via `run_fs_op` (same pattern as Mounting/Formatting).
+    enum PendingFsOp {
+        Rename {
+            entry: NameEntry,
+            destination: String,
+        },
+        Move {
+            picker: MovePicker,
+            destination: String,
+        },
+        Delete {
+            explorer: Explorer,
+            item: DirectoryItem,
+        },
+    }
+
+    impl PendingFsOp {
+        fn title(&self) -> &'static str {
+            match self {
+                Self::Rename { .. } => "RENAMING",
+                Self::Move { .. } => "MOVING",
+                Self::Delete { .. } => "DELETING",
+            }
+        }
+    }
+
     #[derive(Clone, Copy)]
     enum DeleteChoice {
         Cancel,
@@ -518,6 +595,9 @@ mod firmware {
         Mounting,
         FormatPrompt {
             reason: &'static str,
+            /// Set by TOP LEFT; disarms the confirmation hold until TOP
+            /// RIGHT re-arms it.
+            cancelled: bool,
             /// RTC tick when this prompt appeared. The confirmation hold only
             /// counts presses that began at or after this moment.
             opened_at: u32,
@@ -539,6 +619,21 @@ mod firmware {
             choice: ExitChoice,
         },
         Fatal(&'static str),
+    }
+
+    /// What a button press produced: the next screen, or a slow filesystem
+    /// operation the event loop must paint a notice for before running it
+    /// synchronously. Keeping pending work out of [`Screen`] makes a
+    /// "working" notice that outlives its operation unrepresentable.
+    enum HandleResult {
+        Screen(Screen),
+        Op(PendingFsOp),
+    }
+
+    impl From<Screen> for HandleResult {
+        fn from(screen: Screen) -> Self {
+            Self::Screen(screen)
+        }
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -926,11 +1021,26 @@ mod firmware {
                 .with(Button::Down, down.is_low().unwrap_or(false));
 
             if let Some(button) = input.update(raw, now) {
-                screen = handle_button(screen, button, &mut volume, mounted_identity);
+                screen = match handle_button(screen, button, &mut volume, mounted_identity) {
+                    HandleResult::Screen(next) => next,
+                    // A pending rename/move runs synchronously; paint the
+                    // busy notice before starting so the display does not
+                    // freeze on the old screen.
+                    HandleResult::Op(op) => {
+                        terminal
+                            .draw(|frame| draw_busy(frame, op.title(), battery))
+                            .ok();
+                        run_fs_op(op, &mut volume)
+                    }
+                };
                 dirty = true;
             }
 
-            if let Screen::FormatPrompt { opened_at, .. } = &screen
+            if let Screen::FormatPrompt {
+                cancelled: false,
+                opened_at,
+                ..
+            } = &screen
             {
                 let opened_at = *opened_at;
                 let held = input.held_ticks(Button::TopRight, now);
@@ -1007,7 +1117,7 @@ mod firmware {
                 .map_err(|_| MountFailure::Io)?;
             controller.borrow().mark_card_uninit();
         }
-        let device = ControllerDevice(controller.clone());
+        let device = ControllerDevice::new(controller.clone());
         let mut stream = SdStream::new(device).map_err(|_| MountFailure::Io)?;
         let sectors = (stream.len() / 512).min(u32::MAX as u64) as u32;
         controller.borrow().spi(|spi| {
@@ -1034,7 +1144,7 @@ mod firmware {
             volume_serial: layout.volume_serial,
         };
         drop(stream);
-        let volume = Fs::mount(ControllerDevice(controller.clone()), layout)
+        let volume = Fs::mount(ControllerDevice::new(controller.clone()), layout)
             .map_err(|error| match error {
                 embedded_sdmmc::Error::DeviceError(_) => MountFailure::Io,
                 embedded_sdmmc::Error::Unsupported => MountFailure::Unsupported,
@@ -1103,7 +1213,7 @@ mod firmware {
     /// at the moment the user confirmed the format: uptime plus human timing
     /// is the only entropy available on a device without a calendar clock.
     fn format_card(controller: &Rc<RefCell<Controller>>, seed: u32) -> Result<(), FormatFailure> {
-        let device = ControllerDevice(controller.clone());
+        let device = ControllerDevice::new(controller.clone());
         let mut stream = SdStream::new(device).map_err(|_| FormatFailure::Io)?;
         let total_sectors = stream.len() / 512;
         // MBR LBA fields and the backup-GPT erase cannot address sectors
@@ -1131,6 +1241,7 @@ mod firmware {
                 MountFailure::Invalid => "Invalid or damaged filesystem",
                 MountFailure::Io => unreachable!(),
             },
+            cancelled: false,
             opened_at: now,
         }
     }
@@ -1182,22 +1293,180 @@ mod firmware {
         button: Button,
         volume: &mut Option<Fs>,
         identity: Option<MediaIdentity>,
-    ) -> Screen {
+    ) -> HandleResult {
         match screen {
-            Screen::Explorer(explorer) => handle_explorer(explorer, button, volume, identity),
-            Screen::NewMenu(menu) => handle_new_menu(menu, button),
-            Screen::ActionMenu(menu) => handle_action_menu(menu, button, volume),
+            Screen::Explorer(explorer) => {
+                handle_explorer(explorer, button, volume, identity).into()
+            }
+            Screen::NewMenu(menu) => handle_new_menu(menu, button).into(),
+            Screen::ActionMenu(menu) => handle_action_menu(menu, button, volume).into(),
             Screen::Naming(entry) => handle_name_entry(entry, button, volume, identity),
             Screen::MovePicker(picker) => handle_move_picker(picker, button, volume),
             Screen::DeletePrompt {
                 explorer,
                 item,
                 choice,
-            } => handle_delete_prompt(explorer, item, choice, button, volume),
-            Screen::Editor(editor) => handle_editor(editor, button, volume),
-            Screen::ExitPrompt { editor, choice } => handle_exit(editor, choice, button, volume),
-            Screen::Fatal(_) if button == Button::TopRight => Screen::Missing,
-            other => other,
+            } => handle_delete_prompt(explorer, item, choice, button),
+            Screen::Editor(editor) => handle_editor(editor, button, volume).into(),
+            Screen::ExitPrompt { editor, choice } => {
+                handle_exit(editor, choice, button, volume).into()
+            }
+            Screen::FormatPrompt {
+                reason, opened_at, ..
+            } if button == Button::TopLeft => Screen::FormatPrompt {
+                reason,
+                cancelled: true,
+                opened_at,
+            }
+            .into(),
+            // A retry needs no fresh opened_at: it fires on a new press event,
+            // so that press necessarily began after the prompt opened.
+            Screen::FormatPrompt {
+                reason,
+                cancelled: true,
+                opened_at,
+            } if button == Button::TopRight => Screen::FormatPrompt {
+                reason,
+                cancelled: false,
+                opened_at,
+            }
+            .into(),
+            Screen::Fatal(_) if button == Button::TopRight => Screen::Missing.into(),
+            other => other.into(),
+        }
+    }
+
+    /// Land a finished rename/move on the destination entry. `source_remains`
+    /// marks success-with-caveat: the destination holds a verified copy and
+    /// only the source entry's removal failed (`DeleteIncomplete` or
+    /// `SourceRemains`), so reporting "<verb> failed" would invite the
+    /// user to delete the only good copy.
+    fn complete_move_op(
+        card: &Fs,
+        mut explorer: Explorer,
+        destination: &str,
+        verb: &str,
+        source_remains: bool,
+    ) -> Screen {
+        explorer.refresh_select_path(card, destination);
+        explorer.status = Some(if source_remains {
+            format!("{verb}; {OLD_ENTRY_REMAINS}")
+        } else {
+            verb.into()
+        });
+        Screen::Explorer(explorer)
+    }
+
+    /// How a finished rename/move landed. Both `run_fs_op` arms classify
+    /// their shared `move_entry_verified` result through [`move_outcome`]
+    /// so the two operations can never drift apart on the same on-card
+    /// outcome.
+    enum MoveOutcome {
+        /// The destination holds the verified entry; `source_remains`
+        /// carries the success-with-caveat flag for [`complete_move_op`].
+        Done { source_remains: bool },
+        /// The operation did not land; show this status on the input
+        /// screen.
+        Rejected(String),
+    }
+
+    fn move_outcome(
+        result: Result<(), FsOpError<embedded_sdmmc::SdCardError>>,
+        fail_verb: &str,
+        exists_status: &str,
+    ) -> MoveOutcome {
+        match result {
+            Ok(()) => MoveOutcome::Done {
+                source_remains: false,
+            },
+            Err(FsOpError::DeleteIncomplete(_) | FsOpError::SourceRemains(_)) => {
+                MoveOutcome::Done {
+                    source_remains: true,
+                }
+            }
+            Err(FsOpError::AlreadyExists) => MoveOutcome::Rejected(exists_status.into()),
+            Err(error) => MoveOutcome::Rejected(format!(
+                "{fail_verb} failed: {}",
+                save_failure_reason(&error)
+            )),
+        }
+    }
+
+    /// Run the rename/move a [`HandleResult::Op`] carries. The event loop
+    /// calls this right after painting the busy notice.
+    fn run_fs_op(op: PendingFsOp, volume: &mut Option<Fs>) -> Screen {
+        let Some(card) = volume.as_ref() else {
+            return Screen::Missing;
+        };
+        match op {
+            PendingFsOp::Rename { mut entry, destination } => {
+                let source = entry.source.as_ref().expect("rename has a source");
+                match move_outcome(
+                    card.move_entry_verified(&source.path, &destination),
+                    "Rename",
+                    "That name already exists",
+                ) {
+                    MoveOutcome::Done { source_remains } => {
+                        complete_move_op(card, entry.explorer, &destination, "Renamed", source_remains)
+                    }
+                    MoveOutcome::Rejected(status) => {
+                        entry.status = Some(status);
+                        Screen::Naming(entry)
+                    }
+                }
+            }
+            PendingFsOp::Move { mut picker, destination } => {
+                match move_outcome(
+                    card.move_entry_verified(&picker.source.path, &destination),
+                    "Move",
+                    "That name already exists here",
+                ) {
+                    MoveOutcome::Done { source_remains } => {
+                        let explorer = Explorer {
+                            path: picker.path,
+                            ..Explorer::root()
+                        };
+                        complete_move_op(card, explorer, &destination, "Moved", source_remains)
+                    }
+                    MoveOutcome::Rejected(status) => {
+                        picker.status = Some(status);
+                        Screen::MovePicker(picker)
+                    }
+                }
+            }
+            PendingFsOp::Delete { mut explorer, item } => {
+                match card.delete_verified(&item.path, item.is_dir) {
+                    Ok(()) => {
+                        explorer.refresh(card);
+                        explorer.status = Some(if item.is_dir {
+                            "Folder deleted".into()
+                        } else {
+                            "File deleted".into()
+                        });
+                    }
+                    Err(error) => {
+                        explorer.refresh(card);
+                        explorer.status = Some(match &error {
+                            // Destruction persisted (contents reclaimed or
+                            // children removed) before the failure:
+                            // "incomplete" is the truth ("Delete
+                            // incomplete: data removed" is 31 columns).
+                            FsOpError::DeleteIncomplete(_) => {
+                                format!("Delete incomplete: {}", save_failure_reason(&error))
+                            }
+                            // Refusals (read-only, non-empty folder, not
+                            // found...) destroyed nothing; saying
+                            // "incomplete" would claim partial destruction
+                            // that never happened. "Not deleted: " plus the
+                            // longest common reason ("folder is not empty")
+                            // is exactly 32 columns; rarer long reasons
+                            // clip via truncate.
+                            _ => format!("Not deleted: {}", save_failure_reason(&error)),
+                        });
+                    }
+                }
+                Screen::Explorer(explorer)
+            }
         }
     }
 
@@ -1375,13 +1644,20 @@ mod firmware {
         button: Button,
         volume: &mut Option<Fs>,
         identity: Option<MediaIdentity>,
-    ) -> Screen {
+    ) -> HandleResult {
         if button == Button::TopLeft {
-            return Screen::Explorer(entry.explorer);
+            // Re-list before handing the explorer back: a failed rename may
+            // have left an on-card ghost (partial copy) that the listing
+            // captured before the operation cannot show.
+            let Some(card) = volume.as_ref() else {
+                return Screen::Missing.into();
+            };
+            entry.explorer.refresh(card);
+            return Screen::Explorer(entry.explorer).into();
         }
         if button == Button::TopMiddle {
             entry.keyboard_visible = !entry.keyboard_visible;
-            return Screen::Naming(entry);
+            return Screen::Naming(entry).into();
         }
         if button == Button::TopRight {
             let validation = match entry.mode {
@@ -1390,10 +1666,10 @@ mod firmware {
             };
             if let Err(message) = validation {
                 entry.status = Some(message.into());
-                return Screen::Naming(entry);
+                return Screen::Naming(entry).into();
             }
             let Some(card) = volume.as_ref() else {
-                return Screen::Missing;
+                return Screen::Missing.into();
             };
             match entry.mode {
                 NameMode::NewText => {
@@ -1413,7 +1689,8 @@ mod firmware {
                                 status: None,
                                 media: EditorMedia::Ready,
                                 identity: identity.expect("mounted name entry has identity"),
-                            });
+                            })
+                            .into();
                         }
                         Err(FsOpError::AlreadyExists) => {
                             entry.status = Some("That file already exists".into())
@@ -1430,7 +1707,7 @@ mod firmware {
                         Ok(()) => {
                             entry.explorer.refresh_select_path(card, &path);
                             entry.explorer.status = Some("Folder created".into());
-                            return Screen::Explorer(entry.explorer);
+                            return Screen::Explorer(entry.explorer).into();
                         }
                         Err(FsOpError::AlreadyExists) => {
                             entry.status = Some("That name already exists".into())
@@ -1442,25 +1719,13 @@ mod firmware {
                     }
                 }
                 NameMode::Rename => {
-                    let source = entry.source.as_ref().expect("rename has a source");
-                    let path = join_path(&entry.explorer.path, &entry.name);
-                    match card.move_entry_verified(&source.path, &path) {
-                        Ok(()) => {
-                            entry.explorer.refresh_select_path(card, &path);
-                            entry.explorer.status = Some("Renamed".into());
-                            return Screen::Explorer(entry.explorer);
-                        }
-                        Err(FsOpError::AlreadyExists) => {
-                            entry.status = Some("That name already exists".into())
-                        }
-                        Err(error) => {
-                            entry.status =
-                                Some(format!("Rename failed: {}", save_failure_reason(&error)))
-                        }
-                    }
+                    // The copy-based rename is slow; hand it to the event
+                    // loop so a busy notice is painted before it starts.
+                    let destination = join_path(&entry.explorer.path, &entry.name);
+                    return HandleResult::Op(PendingFsOp::Rename { entry, destination });
                 }
             }
-            return Screen::Naming(entry);
+            return Screen::Naming(entry).into();
         }
 
         if !entry.keyboard_visible {
@@ -1470,10 +1735,10 @@ mod firmware {
                 Button::Click => entry.keyboard_visible = true,
                 _ => {}
             }
-            return Screen::Naming(entry);
+            return Screen::Naming(entry).into();
         }
         if move_keyboard(&mut entry.keyboard, button) {
-            return Screen::Naming(entry);
+            return Screen::Naming(entry).into();
         }
         if button == Button::Click {
             let key = entry.keyboard.selected();
@@ -1502,19 +1767,25 @@ mod firmware {
                 _ => {}
             }
         }
-        Screen::Naming(entry)
+        Screen::Naming(entry).into()
     }
 
     fn handle_move_picker(
         mut picker: MovePicker,
         button: Button,
         volume: &mut Option<Fs>,
-    ) -> Screen {
+    ) -> HandleResult {
         let Some(card) = volume.as_ref() else {
-            return Screen::Missing;
+            return Screen::Missing.into();
         };
         match button {
-            Button::TopLeft => return Screen::Explorer(picker.origin),
+            Button::TopLeft => {
+                // Re-list before handing the origin explorer back: a failed
+                // move may have changed the card since it was captured.
+                let mut origin = picker.origin;
+                origin.refresh(card);
+                return Screen::Explorer(origin).into();
+            }
             Button::Up => {
                 if picker.selected > 0 {
                     picker.selected -= 1;
@@ -1546,47 +1817,29 @@ mod firmware {
                 let old_parent = parent_path(&picker.source.path);
                 if old_parent.eq_ignore_ascii_case(&picker.path) {
                     picker.status = Some("Item is already in this folder".into());
-                    return Screen::MovePicker(picker);
+                    return Screen::MovePicker(picker).into();
                 }
                 // The destination keeps the entry's stored 8.3 name (the last
                 // path component), not the display name: a long display name
                 // cannot be created on the destination side.
                 let destination = join_path(&picker.path, leaf_name(&picker.source.path));
-                match card.move_entry_verified(&picker.source.path, &destination) {
-                    Ok(()) => {
-                        let mut explorer = Explorer {
-                            path: picker.path,
-                            offset: 0,
-                            selected: 0,
-                            entries: Vec::new(),
-                            total: 0,
-                            free_bytes: None,
-                            status: None,
-                        };
-                        explorer.refresh_select_path(card, &destination);
-                        explorer.status = Some("Moved".into());
-                        return Screen::Explorer(explorer);
-                    }
-                    Err(FsOpError::AlreadyExists) => {
-                        picker.status = Some("That name already exists here".into())
-                    }
-                    Err(error) => {
-                        picker.status =
-                            Some(format!("Move failed: {}", save_failure_reason(&error)))
-                    }
-                }
+                // The copy-based move is slow; hand it to the event loop so
+                // a busy notice is painted before it starts.
+                return HandleResult::Op(PendingFsOp::Move {
+                    picker,
+                    destination,
+                });
             }
         }
-        Screen::MovePicker(picker)
+        Screen::MovePicker(picker).into()
     }
 
     fn handle_delete_prompt(
-        mut explorer: Explorer,
+        explorer: Explorer,
         item: DirectoryItem,
         mut choice: DeleteChoice,
         button: Button,
-        volume: &mut Option<Fs>,
-    ) -> Screen {
+    ) -> HandleResult {
         match button {
             Button::Left | Button::Right | Button::Up | Button::Down => {
                 choice = match choice {
@@ -1594,32 +1847,14 @@ mod firmware {
                     DeleteChoice::Delete => DeleteChoice::Cancel,
                 }
             }
-            Button::TopLeft => return Screen::Explorer(explorer),
+            Button::TopLeft => return Screen::Explorer(explorer).into(),
             Button::Click | Button::TopMiddle | Button::TopRight => match choice {
-                DeleteChoice::Cancel => return Screen::Explorer(explorer),
+                DeleteChoice::Cancel => return Screen::Explorer(explorer).into(),
+                // A recursive folder delete walks and rewrites the card for
+                // seconds; hand it to the event loop so the busy notice
+                // paints first (run_fs_op handles a missing card).
                 DeleteChoice::Delete => {
-                    let Some(card) = volume.as_ref() else {
-                        return Screen::Missing;
-                    };
-                    match card.delete_verified(&item.path, item.is_dir) {
-                        Ok(()) => {
-                            explorer.refresh(card);
-                            explorer.status = Some(if item.is_dir {
-                                "Folder deleted".into()
-                            } else {
-                                "File deleted".into()
-                            });
-                            return Screen::Explorer(explorer);
-                        }
-                        Err(error) => {
-                            explorer.refresh(card);
-                            explorer.status = Some(format!(
-                                "Delete incomplete: {}",
-                                save_failure_reason(&error)
-                            ));
-                            return Screen::Explorer(explorer);
-                        }
-                    }
+                    return HandleResult::Op(PendingFsOp::Delete { explorer, item });
                 }
             },
         }
@@ -1628,6 +1863,7 @@ mod firmware {
             item,
             choice,
         }
+        .into()
     }
 
     fn handle_editor(mut editor: Editor, button: Button, volume: &mut Option<Fs>) -> Screen {
@@ -1706,7 +1942,15 @@ mod firmware {
                 true
             }
             Err(error) => {
-                editor.status = Some(format!("Save failed: {}", save_failure_reason(&error)));
+                editor.status = Some(match &error.backup_kept {
+                    // "Save failed; kept ~WIO0000.BAK" is 30 columns: it
+                    // fits the editor's 32-column status line and the exit
+                    // prompt's 30-column repeat of it. The surviving backup
+                    // is the actionable fact for a save whose target may be
+                    // partial.
+                    Some(backup) => format!("Save failed; kept {}", leaf_name(backup)),
+                    None => format!("Save failed: {}", save_failure_reason(&error.error)),
+                });
                 false
             }
         }
@@ -1771,16 +2015,35 @@ mod firmware {
             .map_or(text.len(), |(i, _)| at + i)
     }
 
-    fn draw(frame: &mut Frame, screen: &Screen, battery: Option<BatteryStatus>) {
+    /// Shown while an operation holds the card busy (formatting, or a
+    /// pending rename/move).
+    const CARD_BUSY_WARNING: &str = "Do not remove the card";
+
+    /// The shell every full repaint shares: black clear, content, and the
+    /// battery chassis painted last so it overlays whatever the content
+    /// drew. `content` receives whether the battery indicator is shown.
+    fn draw_frame(
+        frame: &mut Frame,
+        battery: Option<BatteryStatus>,
+        content: impl FnOnce(&mut Frame, bool),
+    ) {
         let area = frame.area();
         frame.render_widget(UiBlock::new().style(Style::new().bg(Color::Black)), area);
-        let battery_shown = battery.is_some();
-        match screen {
+        content(frame, battery.is_some());
+        if let Some(battery) = battery {
+            draw_battery(frame, battery);
+        }
+    }
+
+    fn draw(frame: &mut Frame, screen: &Screen, battery: Option<BatteryStatus>) {
+        draw_frame(frame, battery, |frame, battery_shown| match screen {
             Screen::Missing => draw_center(frame, "SD CARD", "Insert an SD card"),
             Screen::Mounting => draw_center(frame, "SD CARD", "Mounting..."),
-            Screen::Formatting => draw_center(frame, "FORMATTING", "Do not remove the card"),
+            Screen::Formatting => draw_center(frame, "FORMATTING", CARD_BUSY_WARNING),
             Screen::Fatal(message) => draw_center(frame, "ERROR", message),
-            Screen::FormatPrompt { reason, .. } => draw_format_prompt(frame, reason),
+            Screen::FormatPrompt {
+                reason, cancelled, ..
+            } => draw_format_prompt(frame, reason, *cancelled),
             Screen::Explorer(explorer) => draw_explorer(frame, explorer, battery_shown),
             Screen::NewMenu(menu) => draw_new_menu(frame, menu, battery_shown),
             Screen::ActionMenu(menu) => draw_action_menu(frame, menu, battery_shown),
@@ -1796,10 +2059,16 @@ mod firmware {
                 draw_editor(frame, editor, false, battery_shown);
                 draw_exit_prompt(frame, *choice, editor.status.as_deref());
             }
-        }
-        if let Some(battery) = battery {
-            draw_battery(frame, battery);
-        }
+        });
+    }
+
+    /// The blocking notice for a [`PendingFsOp`], painted by the event loop
+    /// right before the operation runs; pending work is not a [`Screen`],
+    /// so it cannot go through `draw`.
+    fn draw_busy(frame: &mut Frame, title: &str, battery: Option<BatteryStatus>) {
+        draw_frame(frame, battery, |frame, _| {
+            draw_center(frame, title, CARD_BUSY_WARNING);
+        });
     }
 
     fn draw_battery(frame: &mut Frame, battery: BatteryStatus) {
@@ -1833,7 +2102,7 @@ mod firmware {
         );
     }
 
-    fn draw_format_prompt(frame: &mut Frame, reason: &str) {
+    fn draw_format_prompt(frame: &mut Frame, reason: &str, cancelled: bool) {
         draw_center(frame, "FORMAT SD CARD?", reason);
         frame.render_widget(
             Paragraph::new("Formatting erases ALL data")
@@ -1841,8 +2110,13 @@ mod firmware {
                 .style(Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)),
             Rect::new(0, 7, 32, 1),
         );
+        let footer = if cancelled {
+            "Cancelled     RIGHT: retry"
+        } else {
+            "LEFT: cancel  Hold RIGHT 2s"
+        };
         frame.render_widget(
-            Paragraph::new("Hold TOP RIGHT 2s").alignment(Alignment::Center),
+            Paragraph::new(footer).alignment(Alignment::Center),
             Rect::new(0, 10, 32, 1),
         );
     }

@@ -31,7 +31,8 @@ counted from the FAT itself.
 Rename edits the complete stored file or folder name, including a file
 extension. Move opens a folder-only destination picker and never replaces an
 existing item. Renames and moves copy the entry to its new name and then
-delete the original (folders recursively), so moving a large file takes time.
+delete the original (folders recursively), so moving a large file takes time;
+a working notice is shown while the operation runs.
 A folder move that fails partway removes its partial destination copy, but an
 interrupted one (power loss, card removal) can still leave that partial copy
 behind. Entries carrying the read-only attribute -- and folders containing
@@ -68,8 +69,9 @@ skipped, matching what the mount layer accepts.
 
 When a readable card has an unsupported or invalid layout, the device offers
 to create one MBR-aligned FAT32 partition. **Formatting erases the entire
-card.** Cancel is the default action and formatting requires holding the
-top-right button for two seconds. I/O failures do not offer formatting.
+card.** The top-left button cancels, disarming the prompt (top-right re-arms
+it), and formatting requires holding the top-right button for two seconds.
+I/O failures do not offer formatting.
 
 Saves rewrite the complete document and read it back before reporting success.
 Before the document itself is touched, the new contents are staged and
