@@ -22,6 +22,9 @@ embedded-alloc = { version = "0.7", default-features = false, features = ["llff"
 mousefood = { version = "0.5.2", default-features = false }
 panic-halt = "0.2"
 ratatui = { version = "0.30.2", default-features = false }
+# The "wifi" feature is unused by this demo, but wio_terminal 0.9.0 fails to
+# build without it: pins.rs imports the feature-gated wifi module
+# unconditionally (its Pins struct always carries a WifiPins field).
 wio_terminal = { version = "0.9.0", default-features = false, features = ["rt", "wifi"] }
 
 [profile.release]

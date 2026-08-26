@@ -29,7 +29,7 @@ mod firmware {
     use ratatui::layout::{Alignment, Rect};
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::{Line, Span};
-    use ratatui::widgets::{Block as UiBlock, Paragraph};
+    use ratatui::widgets::{Block as UiBlock, Paragraph, Wrap};
     use ratatui::{Frame, Terminal};
     use unifat::{FsOptions, Partition, Volume};
     use wio_terminal as wio;
@@ -56,6 +56,12 @@ mod firmware {
     const POLL_TICKS: u32 = 21;
     const BATTERY_POLL_TICKS: u32 = 2 * 1024;
     const FORMAT_HOLD_TICKS: u32 = 2 * 1024;
+    // ~250 ms at 1024 Hz, applied to insertion only. A card slides past the
+    // detect switch before its contacts are seated, so mounting on the first
+    // sampled edge can fail mid-insertion. Removal is acted on immediately:
+    // every sampled absence unmounts and marks the card uninitialized, so no
+    // write can be dispatched to a card that is leaving the slot.
+    const CARD_SETTLE_TICKS: u32 = 256;
     const BQ27441_ADDRESS: u8 = 0x55;
     const BQ27441_AVERAGE_CURRENT: u8 = 0x10;
     const BQ27441_STATE_OF_CHARGE: u8 = 0x1c;
@@ -529,6 +535,9 @@ mod firmware {
         FormatPrompt {
             reason: &'static str,
             cancelled: bool,
+            /// RTC tick when this prompt appeared. The confirmation hold only
+            /// counts presses that began at or after this moment.
+            opened_at: u32,
         },
         Formatting,
         Explorer(Explorer),
@@ -840,6 +849,8 @@ mod firmware {
         let mut last_battery_poll = last_poll.wrapping_sub(BATTERY_POLL_TICKS);
         let mut battery = None;
         let mut last_present = false;
+        let mut observed_present = false;
+        let mut present_changed_at = last_poll;
         terminal.draw(|frame| draw(frame, &screen, battery)).ok();
         let mut dirty = false;
 
@@ -859,8 +870,17 @@ mod firmware {
                 }
             }
 
-            let present = card_detect.is_low().unwrap_or(false);
-            if present != last_present {
+            let raw_present = card_detect.is_low().unwrap_or(false);
+            if raw_present != observed_present {
+                observed_present = raw_present;
+                present_changed_at = now;
+            }
+            // Removal acts on the first absent sample; insertion waits for
+            // the raw reading to hold steady for the settle window.
+            let present = observed_present;
+            if present != last_present
+                && (!present || now.wrapping_sub(present_changed_at) >= CARD_SETTLE_TICKS)
+            {
                 last_present = present;
                 dirty = true;
                 if !present {
@@ -890,7 +910,7 @@ mod firmware {
                                     editor.media = EditorMedia::Different;
                                     Screen::ExitPrompt { editor, choice }
                                 }
-                                _ => format_prompt(failure),
+                                _ => format_prompt(failure, now),
                             };
                         }
                     }
@@ -912,30 +932,42 @@ mod firmware {
                 dirty = true;
             }
 
-            if matches!(
-                screen,
-                Screen::FormatPrompt {
-                    cancelled: false,
-                    ..
-                }
-            ) && input.held_ticks(Button::TopRight, now) >= FORMAT_HOLD_TICKS
+            if let Screen::FormatPrompt {
+                cancelled: false,
+                opened_at,
+                ..
+            } = &screen
             {
-                screen = Screen::Formatting;
-                terminal.draw(|frame| draw(frame, &screen, battery)).ok();
-                match format_card(&controller).and_then(|_| mount_card(&controller)) {
-                    Ok((new_volume, identity)) => {
-                        let mut explorer = Explorer::root();
-                        explorer.refresh(&new_volume);
-                        volume = Some(new_volume);
-                        mounted_identity = Some(identity);
-                        screen = Screen::Explorer(explorer);
+                let opened_at = *opened_at;
+                let held = input.held_ticks(Button::TopRight, now);
+                // The press must have started at or after the prompt appeared
+                // (wrapping-safe); otherwise a button already held during
+                // mounting would trigger formatting the instant the prompt
+                // opened.
+                if held >= FORMAT_HOLD_TICKS && now.wrapping_sub(opened_at) >= held {
+                    screen = Screen::Formatting;
+                    terminal.draw(|frame| draw(frame, &screen, battery)).ok();
+                    match format_card(&controller, now).and_then(|_| mount_card(&controller)) {
+                        Ok((new_volume, identity)) => {
+                            let mut explorer = Explorer::root();
+                            explorer.refresh(&new_volume);
+                            volume = Some(new_volume);
+                            mounted_identity = Some(identity);
+                            screen = Screen::Explorer(explorer);
+                        }
+                        Err(MountFailure::Io) => {
+                            screen = Screen::Fatal("Formatting failed: SD I/O error")
+                        }
+                        // Only format_card's size guard produces Unsupported
+                        // here: the formatter never writes the partition
+                        // types that make mount_card report it.
+                        Err(MountFailure::Unsupported) => {
+                            screen = Screen::Fatal("Card too large to format")
+                        }
+                        Err(_) => screen = Screen::Fatal("Formatting failed verification"),
                     }
-                    Err(MountFailure::Io) => {
-                        screen = Screen::Fatal("Formatting failed: SD I/O error")
-                    }
-                    Err(_) => screen = Screen::Fatal("Formatting failed verification"),
+                    dirty = true;
                 }
-                dirty = true;
             }
 
             if dirty {
@@ -1008,18 +1040,28 @@ mod firmware {
         Ok((volume, identity))
     }
 
-    fn format_card(controller: &Rc<RefCell<Controller>>) -> Result<(), MountFailure> {
+    /// `seed` perturbs the new volume serial. The caller passes the RTC tick
+    /// at the moment the user confirmed the format: uptime plus human timing
+    /// is the only entropy available on a device without a calendar clock.
+    fn format_card(controller: &Rc<RefCell<Controller>>, seed: u32) -> Result<(), MountFailure> {
         let device = ControllerDevice(controller.clone());
         let mut stream = SdStream::new(device).map_err(|_| MountFailure::Io)?;
-        let sectors = (stream.len() / 512).min(u32::MAX as u64) as u32;
-        format_fat32(&mut stream, sectors).map_err(|error| match error {
+        let total_sectors = stream.len() / 512;
+        // MBR LBA fields and the backup-GPT erase cannot address sectors
+        // past 2 TiB; refuse rather than write a wrong geometry or leave a
+        // stale backup GPT header at the true last LBA.
+        if total_sectors > u64::from(u32::MAX) {
+            return Err(MountFailure::Unsupported);
+        }
+        let sectors = total_sectors as u32;
+        format_fat32(&mut stream, sectors, seed).map_err(|error| match error {
             wio_terminal_sd_editor::FormatError::Io(_) => MountFailure::Io,
             _ => MountFailure::Invalid,
         })?;
         Ok(())
     }
 
-    fn format_prompt(failure: MountFailure) -> Screen {
+    fn format_prompt(failure: MountFailure, now: u32) -> Screen {
         if failure == MountFailure::Io {
             return Screen::Fatal("SD read failed; remove and reinsert");
         }
@@ -1030,6 +1072,7 @@ mod firmware {
                 MountFailure::Io => unreachable!(),
             },
             cancelled: false,
+            opened_at: now,
         }
     }
 
@@ -1050,6 +1093,9 @@ mod firmware {
     fn accept_inserted_card(screen: Screen, identity: MediaIdentity) -> Screen {
         match screen {
             Screen::Editor(mut editor) => {
+                // Any status ("Reinsert the original SD card to save", ...)
+                // described the previous media state.
+                editor.status = None;
                 if editor.identity == identity {
                     editor.media = EditorMedia::Ready;
                 } else {
@@ -1059,6 +1105,7 @@ mod firmware {
                 Screen::Editor(editor)
             }
             Screen::ExitPrompt { mut editor, choice } => {
+                editor.status = None;
                 if editor.identity == identity {
                     editor.media = EditorMedia::Ready;
                 } else {
@@ -1090,18 +1137,23 @@ mod firmware {
             } => handle_delete_prompt(explorer, item, choice, button, volume),
             Screen::Editor(editor) => handle_editor(editor, button, volume),
             Screen::ExitPrompt { editor, choice } => handle_exit(editor, choice, button, volume),
-            Screen::FormatPrompt { reason, .. } if button == Button::TopLeft => {
-                Screen::FormatPrompt {
-                    reason,
-                    cancelled: true,
-                }
-            }
+            Screen::FormatPrompt {
+                reason, opened_at, ..
+            } if button == Button::TopLeft => Screen::FormatPrompt {
+                reason,
+                cancelled: true,
+                opened_at,
+            },
+            // A retry needs no fresh opened_at: it fires on a new press event,
+            // so that press necessarily began after the prompt opened.
             Screen::FormatPrompt {
                 reason,
                 cancelled: true,
+                opened_at,
             } if button == Button::TopRight => Screen::FormatPrompt {
                 reason,
                 cancelled: false,
+                opened_at,
             },
             Screen::Fatal(_) if button == Button::TopRight => Screen::Missing,
             other => other,
@@ -1538,13 +1590,18 @@ mod firmware {
     ) -> Screen {
         match button {
             Button::TopLeft => {
+                // The dialog repeats editor.status as save feedback, so a
+                // message left over from earlier editing must not carry in.
+                editor.status = None;
                 return Screen::ExitPrompt {
                     editor,
                     choice: ExitChoice::Cancel,
-                }
+                };
             }
             Button::TopMiddle => editor.keyboard_visible = !editor.keyboard_visible,
-            Button::TopRight => save_editor(&mut editor, volume),
+            Button::TopRight => {
+                save_editor(&mut editor, volume);
+            }
             _ if editor.keyboard_visible => {
                 if !move_keyboard(&mut editor.keyboard, button) && button == Button::Click {
                     let key = editor.keyboard.selected();
@@ -1582,7 +1639,8 @@ mod firmware {
         Screen::Editor(editor)
     }
 
-    fn save_editor(editor: &mut Editor, volume: &mut Option<CardVolume>) {
+    /// Returns whether the document verifiably reached the card.
+    fn save_editor(editor: &mut Editor, volume: &mut Option<CardVolume>) -> bool {
         if editor.media != EditorMedia::Ready {
             editor.status = Some(
                 match editor.media {
@@ -1592,19 +1650,21 @@ mod firmware {
                 }
                 .into(),
             );
-            return;
+            return false;
         }
         let Some(card) = volume.as_ref() else {
             editor.status = Some("SD card is unavailable".into());
-            return;
+            return false;
         };
         match save_transactional(card, &editor.path, editor.buffer.bytes()) {
             Ok(()) => {
                 editor.buffer.mark_clean();
                 editor.status = Some("Saved".into());
+                true
             }
             Err(error) => {
-                editor.status = Some(format!("Save failed: {}", save_failure_reason(&error)))
+                editor.status = Some(format!("Save failed: {}", save_failure_reason(&error)));
+                false
             }
         }
     }
@@ -1629,8 +1689,10 @@ mod firmware {
                     return Screen::Missing;
                 }
                 ExitChoice::Save => {
-                    save_editor(&mut editor, volume);
-                    if editor.buffer.is_dirty() {
+                    // Exit only on a verified save. Dirtiness is not a success
+                    // proxy: a failed save of a never-modified buffer would
+                    // otherwise exit silently.
+                    if !save_editor(&mut editor, volume) {
                         return Screen::ExitPrompt { editor, choice };
                     }
                     if let Some(card) = volume.as_ref() {
@@ -1669,24 +1731,29 @@ mod firmware {
     fn draw(frame: &mut Frame, screen: &Screen, battery: Option<BatteryStatus>) {
         let area = frame.area();
         frame.render_widget(UiBlock::new().style(Style::new().bg(Color::Black)), area);
+        let battery_shown = battery.is_some();
         match screen {
             Screen::Missing => draw_center(frame, "SD CARD", "Insert an SD card"),
             Screen::Mounting => draw_center(frame, "SD CARD", "Mounting..."),
             Screen::Formatting => draw_center(frame, "FORMATTING", "Do not remove the card"),
             Screen::Fatal(message) => draw_center(frame, "ERROR", message),
-            Screen::FormatPrompt { reason, cancelled } => {
-                draw_format_prompt(frame, reason, *cancelled)
+            Screen::FormatPrompt {
+                reason, cancelled, ..
+            } => draw_format_prompt(frame, reason, *cancelled),
+            Screen::Explorer(explorer) => draw_explorer(frame, explorer, battery_shown),
+            Screen::NewMenu(menu) => draw_new_menu(frame, menu, battery_shown),
+            Screen::ActionMenu(menu) => draw_action_menu(frame, menu, battery_shown),
+            Screen::Naming(entry) => draw_name_entry(frame, entry, battery_shown),
+            Screen::MovePicker(picker) => draw_move_picker(frame, picker, battery_shown),
+            Screen::DeletePrompt { item, choice, .. } => {
+                draw_delete_prompt(frame, item, *choice, battery_shown)
             }
-            Screen::Explorer(explorer) => draw_explorer(frame, explorer),
-            Screen::NewMenu(menu) => draw_new_menu(frame, menu),
-            Screen::ActionMenu(menu) => draw_action_menu(frame, menu),
-            Screen::Naming(entry) => draw_name_entry(frame, entry),
-            Screen::MovePicker(picker) => draw_move_picker(frame, picker),
-            Screen::DeletePrompt { item, choice, .. } => draw_delete_prompt(frame, item, *choice),
-            Screen::Editor(editor) => draw_editor(frame, editor),
+            Screen::Editor(editor) => draw_editor(frame, editor, true, battery_shown),
             Screen::ExitPrompt { editor, choice } => {
-                draw_editor(frame, editor);
-                draw_exit_prompt(frame, *choice);
+                // The dialog shows the status itself; suppress the editor's
+                // own copy so the message renders exactly once.
+                draw_editor(frame, editor, false, battery_shown);
+                draw_exit_prompt(frame, *choice, editor.status.as_deref());
             }
         }
         if let Some(battery) = battery {
@@ -1700,15 +1767,13 @@ mod firmware {
         } else {
             format!("{}% BAT", battery.percent)
         };
-        let area = Rect::new(24, 1, 8, 1);
-        frame.render_widget(UiBlock::new().style(Style::new().bg(Color::Black)), area);
         frame.render_widget(
             Paragraph::new(label).alignment(Alignment::Right).style(
                 Style::new()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::BOLD),
             ),
-            area,
+            Rect::new(24, 0, 8, 1),
         );
     }
 
@@ -1720,7 +1785,9 @@ mod firmware {
             Rect::new(0, 3, 32, 1),
         );
         frame.render_widget(
-            Paragraph::new(message).alignment(Alignment::Center),
+            Paragraph::new(message)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true }),
             Rect::new(0, 5, 32, 2),
         );
     }
@@ -1744,8 +1811,8 @@ mod firmware {
         );
     }
 
-    fn draw_explorer(frame: &mut Frame, explorer: &Explorer) {
-        header(frame, "SD FILES", "BROWSE");
+    fn draw_explorer(frame: &mut Frame, explorer: &Explorer, battery_shown: bool) {
+        header(frame, "SD FILES", "BROWSE", battery_shown);
         frame.render_widget(
             Paragraph::new(truncate(&explorer.path, 32)).style(Style::new().fg(Color::DarkGray)),
             Rect::new(0, 1, 32, 1),
@@ -1800,8 +1867,8 @@ mod firmware {
         footer(frame, "UP", "NEW", "ACTIONS");
     }
 
-    fn draw_new_menu(frame: &mut Frame, menu: &NewMenu) {
-        header(frame, "NEW", "SELECT");
+    fn draw_new_menu(frame: &mut Frame, menu: &NewMenu, battery_shown: bool) {
+        header(frame, "NEW", "SELECT", battery_shown);
         draw_menu_item(
             frame,
             3,
@@ -1812,8 +1879,8 @@ mod firmware {
         footer(frame, "CANCEL", "SELECT", "SELECT");
     }
 
-    fn draw_action_menu(frame: &mut Frame, menu: &ActionMenu) {
-        header(frame, "ACTIONS", "SELECT");
+    fn draw_action_menu(frame: &mut Frame, menu: &ActionMenu, battery_shown: bool) {
+        header(frame, "ACTIONS", "SELECT", battery_shown);
         let name = menu
             .item
             .as_ref()
@@ -1850,13 +1917,13 @@ mod firmware {
         );
     }
 
-    fn draw_name_entry(frame: &mut Frame, entry: &NameEntry) {
+    fn draw_name_entry(frame: &mut Frame, entry: &NameEntry, battery_shown: bool) {
         let (title, suffix, action) = match entry.mode {
             NameMode::NewText => ("NEW TEXT FILE", ".txt", "CREATE"),
             NameMode::NewFolder => ("NEW FOLDER", "", "CREATE"),
             NameMode::Rename => ("RENAME", "", "DONE"),
         };
-        header(frame, title, suffix);
+        header(frame, title, suffix, battery_shown);
         frame.render_widget(Paragraph::new("Name:"), Rect::new(0, 2, 32, 1));
         let cursor_chars = entry.name[..entry.cursor].chars().count();
         let start = cursor_chars.saturating_sub(28);
@@ -1884,8 +1951,8 @@ mod firmware {
         footer(frame, "CANCEL", "KEYBOARD", action);
     }
 
-    fn draw_move_picker(frame: &mut Frame, picker: &MovePicker) {
-        header(frame, "MOVE", "FOLDERS");
+    fn draw_move_picker(frame: &mut Frame, picker: &MovePicker, battery_shown: bool) {
+        header(frame, "MOVE", "FOLDERS", battery_shown);
         frame.render_widget(
             Paragraph::new(truncate(&picker.path, 32)).style(Style::new().fg(Color::DarkGray)),
             Rect::new(0, 1, 32, 1),
@@ -1916,11 +1983,17 @@ mod firmware {
         footer(frame, "CANCEL", "MOVE HERE", "REFRESH");
     }
 
-    fn draw_delete_prompt(frame: &mut Frame, item: &DirectoryItem, choice: DeleteChoice) {
+    fn draw_delete_prompt(
+        frame: &mut Frame,
+        item: &DirectoryItem,
+        choice: DeleteChoice,
+        battery_shown: bool,
+    ) {
         header(
             frame,
             "DELETE?",
             if item.is_dir { "FOLDER" } else { "FILE" },
+            battery_shown,
         );
         frame.render_widget(
             Paragraph::new(truncate(&item.name, 32))
@@ -1944,16 +2017,18 @@ mod firmware {
         footer(frame, "CANCEL", "SELECT", "SELECT");
     }
 
-    fn draw_editor(frame: &mut Frame, editor: &Editor) {
+    fn draw_editor(frame: &mut Frame, editor: &Editor, show_status: bool, battery_shown: bool) {
         let dirty = if editor.buffer.is_dirty() { "*" } else { "" };
         header(
             frame,
-            &truncate(&format!("{}{dirty}", editor.name), 20),
+            // Truncate the name alone so the dirty marker survives long names.
+            &format!("{}{dirty}", truncate(&editor.name, 16 - dirty.len())),
             if editor.keyboard_visible {
                 "KEYS"
             } else {
                 "MOVE"
             },
+            battery_shown,
         );
         let visible_lines = if editor.keyboard_visible { 5 } else { 9 };
         let (cursor_line, cursor_col) = editor.buffer.display_position();
@@ -1987,20 +2062,22 @@ mod firmware {
                 Rect::new(0, 1 + row as u16, 32, 1),
             );
         }
-        let status_y = if editor.keyboard_visible { 6 } else { 10 };
-        let status = editor.status.clone().unwrap_or_else(|| {
-            format!(
-                "Ln {} Col {}  {}/{}",
-                cursor_line + 1,
-                cursor_col + 1,
-                editor.buffer.bytes().len(),
-                MAX_DOCUMENT_BYTES
-            )
-        });
-        frame.render_widget(
-            Paragraph::new(truncate(&status, 32)).style(Style::new().fg(Color::DarkGray)),
-            Rect::new(0, status_y, 32, 1),
-        );
+        if show_status {
+            let status_y = if editor.keyboard_visible { 6 } else { 10 };
+            let status = editor.status.clone().unwrap_or_else(|| {
+                format!(
+                    "Ln {} Col {}  {}/{}",
+                    cursor_line + 1,
+                    cursor_col + 1,
+                    editor.buffer.bytes().len(),
+                    MAX_DOCUMENT_BYTES
+                )
+            });
+            frame.render_widget(
+                Paragraph::new(truncate(&status, 32)).style(Style::new().fg(Color::DarkGray)),
+                Rect::new(0, status_y, 32, 1),
+            );
+        }
         if editor.keyboard_visible {
             draw_keyboard(frame, &editor.keyboard, 7);
         }
@@ -2049,7 +2126,7 @@ mod firmware {
         }
     }
 
-    fn draw_exit_prompt(frame: &mut Frame, choice: ExitChoice) {
+    fn draw_exit_prompt(frame: &mut Frame, choice: ExitChoice, status: Option<&str>) {
         frame.render_widget(
             UiBlock::new().style(Style::new().bg(Color::Blue)),
             Rect::new(1, 3, 30, 5),
@@ -2086,6 +2163,16 @@ mod firmware {
             Paragraph::new(Line::from(spans)).alignment(Alignment::Center),
             Rect::new(1, 5, 30, 1),
         );
+        // The dialog covers the editor's own status row, so a save failure
+        // must be repeated inside the dialog to be seen at all.
+        if let Some(status) = status {
+            frame.render_widget(
+                Paragraph::new(truncate(status, 30))
+                    .alignment(Alignment::Center)
+                    .style(Style::new().fg(Color::Yellow).bg(Color::Blue)),
+                Rect::new(1, 6, 30, 1),
+            );
+        }
         frame.render_widget(
             Paragraph::new("Joystick + CLICK")
                 .alignment(Alignment::Center)
@@ -2094,16 +2181,21 @@ mod firmware {
         );
     }
 
-    fn header(frame: &mut Frame, left: &str, right: &str) {
+    /// Row 0 layout: title in columns 0-15, mode hint right-aligned after it.
+    /// While a battery chassis is connected its indicator owns columns 24-31
+    /// and the hint stops at column 23; otherwise the hint extends to the
+    /// top-right corner.
+    fn header(frame: &mut Frame, left: &str, right: &str, battery_shown: bool) {
         frame.render_widget(
             Paragraph::new(left).style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Rect::new(0, 0, 24, 1),
+            Rect::new(0, 0, 16, 1),
         );
+        let hint_width = if battery_shown { 8 } else { 16 };
         frame.render_widget(
             Paragraph::new(right)
                 .alignment(Alignment::Right)
                 .style(Style::new().fg(Color::DarkGray)),
-            Rect::new(24, 0, 8, 1),
+            Rect::new(16, 0, hint_width, 1),
         );
     }
 

@@ -2,10 +2,8 @@
 
 extern crate alloc;
 
-use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use core::cell::RefCell;
 use core::fmt;
 
 use embedded_io::{ErrorType, Read, Seek, SeekFrom, Write};
@@ -927,6 +925,7 @@ pub enum FormatError<E> {
 
 pub fn fat32_geometry(
     media_sectors: u32,
+    serial_seed: u32,
 ) -> Result<FormatGeometry, FormatError<core::convert::Infallible>> {
     const PARTITION_START: u32 = 2_048;
     if media_sectors <= PARTITION_START + 65_525 + 64 {
@@ -964,7 +963,12 @@ pub fn fat32_geometry(
                         sectors_per_cluster,
                         fat_sectors,
                         cluster_count: clusters,
-                        volume_serial: 0x5749_4f00 ^ media_sectors,
+                        // Mix the caller's seed so two same-size cards do not
+                        // share a serial; the serial is what distinguishes a
+                        // reinserted card from a different one.
+                        volume_serial: 0x5749_4f00
+                            ^ media_sectors
+                            ^ serial_seed.wrapping_mul(0x9e37_79b9),
                     });
                 }
                 break;
@@ -978,8 +982,9 @@ pub fn fat32_geometry(
 pub fn format_fat32<S: Read + Write + Seek>(
     storage: &mut S,
     media_sectors: u32,
+    serial_seed: u32,
 ) -> Result<FormatGeometry, FormatError<S::Error>> {
-    let geometry = fat32_geometry(media_sectors).map_err(|error| match error {
+    let geometry = fat32_geometry(media_sectors, serial_seed).map_err(|error| match error {
         FormatError::TooSmall => FormatError::TooSmall,
         _ => FormatError::InvalidGeometry,
     })?;
@@ -994,9 +999,15 @@ pub fn format_fat32<S: Read + Write + Seek>(
     sector[510..512].copy_from_slice(&[0x55, 0xaa]);
     write_sector(storage, 0, &sector).map_err(FormatError::Io)?;
 
+    // A card that previously carried GPT keeps its primary header at LBA 1
+    // and its backup header at the last LBA. Hosts that honor those remnants
+    // over the fresh MBR would see a stale partition table, so erase both.
+    let zero = [0u8; 512];
+    write_sector(storage, 1, &zero).map_err(FormatError::Io)?;
+    write_sector(storage, media_sectors - 1, &zero).map_err(FormatError::Io)?;
+
     let boot = make_boot_sector(&geometry);
     let info = make_fsinfo(&geometry);
-    let zero = [0u8; 512];
     for offset in 0..32 {
         write_sector(storage, geometry.partition_start + offset, &zero).map_err(FormatError::Io)?;
     }
@@ -1206,7 +1217,10 @@ pub fn create_empty<S: Read + Write + Seek>(
         Err(unifat::FsError::NotFound) => {}
         Err(error) => return Err(error),
     }
-    write_verified(volume, path, b"")
+    // No readback verification: a follow-up read through the same mounted
+    // filesystem can serve the intended state from its metadata cache even
+    // when that state never reached the card, masking the write error.
+    volume.write(path, b"")
 }
 
 pub fn create_directory_verified<S: Read + Write + Seek>(
@@ -1281,17 +1295,6 @@ fn exact_entry_exists<S: Read + Write + Seek>(
     Ok(false)
 }
 
-/// Write a complete file without overriding storage or flush errors with a
-/// follow-up read from the same mounted filesystem. Its metadata cache may
-/// contain the intended state even when that state did not reach the card.
-fn write_verified<S: Read + Write + Seek>(
-    volume: &unifat::Volume<S>,
-    path: &str,
-    contents: &[u8],
-) -> Result<(), unifat::FsError<S::Error>> {
-    volume.write(path, contents)
-}
-
 /// Replace a file through one filesystem write and verify every byte by
 /// reading it back. This minimizes SD metadata writes while still refusing to
 /// report success for a partial or corrupt write.
@@ -1300,7 +1303,7 @@ pub fn save_verified<S: Read + Write + Seek>(
     path: &str,
     contents: &[u8],
 ) -> Result<(), unifat::FsError<S::Error>> {
-    write_verified(volume, path, contents)?;
+    volume.write(path, contents)?;
     match volume.read(path) {
         Ok(actual) if actual == contents => Ok(()),
         Ok(_) => Err(unifat::FsError::Corrupt(unifat::CorruptKind::Other)),
@@ -1439,38 +1442,13 @@ pub fn save_transactional<S: Read + Write + Seek>(
     Ok(())
 }
 
-/// A cloneable adapter useful when a board-specific controller must be shared
-/// between the mounted filesystem and card-removal handling.
-pub struct SharedBlockDevice<D>(pub Rc<RefCell<D>>);
-
-impl<D> Clone for SharedBlockDevice<D> {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
-
-impl<D: BlockDevice> BlockDevice for SharedBlockDevice<D> {
-    type Error = D::Error;
-
-    fn read(&self, blocks: &mut [Block], start: BlockIdx) -> Result<(), Self::Error> {
-        self.0.borrow().read(blocks, start)
-    }
-
-    fn write(&self, blocks: &[Block], start: BlockIdx) -> Result<(), Self::Error> {
-        self.0.borrow().write(blocks, start)
-    }
-
-    fn num_blocks(&self) -> Result<BlockCount, Self::Error> {
-        self.0.borrow().num_blocks()
-    }
-}
-
 #[cfg(test)]
 extern crate std;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::rc::Rc;
     use alloc::vec;
     use core::cell::{Cell, RefCell};
 
@@ -1536,10 +1514,17 @@ mod tests {
 
     #[test]
     fn computes_valid_fat32_geometry() {
-        let geometry = fat32_geometry(131_072).unwrap();
+        let geometry = fat32_geometry(131_072, 0).unwrap();
         assert!(geometry.cluster_count >= 65_525);
         assert!(geometry.sectors_per_cluster.is_power_of_two());
         assert!(geometry.partition_start + geometry.partition_sectors <= 131_072);
+
+        let reseeded = fat32_geometry(131_072, 7).unwrap();
+        assert_ne!(geometry.volume_serial, reseeded.volume_serial);
+        assert_eq!(
+            fat32_geometry(131_072, 7).unwrap().volume_serial,
+            reseeded.volume_serial
+        );
     }
 
     struct MockBlocks {
@@ -1672,7 +1657,7 @@ mod tests {
             fail_writes: Rc::new(Cell::new(false)),
         };
         let fail_writes = disk.fail_writes.clone();
-        let geometry = format_fat32(&mut disk, sectors).unwrap();
+        let geometry = format_fat32(&mut disk, sectors, 0).unwrap();
         disk.position = 0;
         let layout = probe_fat(&mut disk, sectors).unwrap();
         assert_eq!(layout.start_lba, geometry.partition_start);
@@ -1784,6 +1769,26 @@ mod tests {
             create_empty(&volume, "/Must also fail.txt"),
             Err(unifat::FsError::Io(_))
         ));
+    }
+
+    #[test]
+    fn format_erases_stale_gpt_headers() {
+        let sectors = 131_072u32;
+        let mut disk = RamDisk {
+            bytes: vec![0; sectors as usize * 512],
+            position: 0,
+            fail_writes: Rc::new(Cell::new(false)),
+        };
+        let last = (sectors as usize - 1) * 512;
+        disk.bytes[512..520].copy_from_slice(b"EFI PART");
+        disk.bytes[last..last + 8].copy_from_slice(b"EFI PART");
+
+        format_fat32(&mut disk, sectors, 0).unwrap();
+
+        assert!(disk.bytes[512..1024].iter().all(|&byte| byte == 0));
+        assert!(disk.bytes[last..last + 512].iter().all(|&byte| byte == 0));
+        disk.position = 0;
+        assert!(probe_fat(&mut disk, sectors).is_ok());
     }
 
     #[test]

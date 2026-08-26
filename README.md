@@ -91,6 +91,11 @@ cargo test --target aarch64-apple-darwin --lib
 Use the appropriate host triple in place of `aarch64-apple-darwin` on other
 platforms.
 
+The included `.vscode/settings.json` sets `rust-analyzer.check.allTargets` to
+`false` so rust-analyzer does not report phantom `can't find crate` errors from
+checking the host-only test module against the embedded default target; apply
+the same rust-analyzer setting in other editors.
+
 ## License
 
 Licensed under either Apache-2.0 or MIT.
