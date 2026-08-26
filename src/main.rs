@@ -29,7 +29,7 @@ mod firmware {
     use ratatui::layout::{Alignment, Rect};
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::{Line, Span};
-    use ratatui::widgets::{Block as UiBlock, Paragraph, Wrap};
+    use ratatui::widgets::{Block as UiBlock, Clear, Paragraph, Wrap};
     use ratatui::{Frame, Terminal};
     use unifat::{FsOptions, Partition, Volume};
     use wio_terminal as wio;
@@ -2089,6 +2089,8 @@ mod firmware {
                 EditorMedia::Different => "Different SD card\nSave disabled; exit/discard",
                 EditorMedia::Ready => "",
             };
+            let area = Rect::new(2, 4, 28, 3);
+            frame.render_widget(Clear, area);
             frame.render_widget(
                 Paragraph::new(message).alignment(Alignment::Center).style(
                     Style::new()
@@ -2096,7 +2098,7 @@ mod firmware {
                         .bg(Color::Red)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Rect::new(2, 4, 28, 3),
+                area,
             );
         }
     }
@@ -2127,10 +2129,11 @@ mod firmware {
     }
 
     fn draw_exit_prompt(frame: &mut Frame, choice: ExitChoice, status: Option<&str>) {
-        frame.render_widget(
-            UiBlock::new().style(Style::new().bg(Color::Blue)),
-            Rect::new(1, 3, 30, 5),
-        );
+        let area = Rect::new(1, 3, 30, 5);
+        // Styling alone only recolors cells; the editor's glyphs underneath
+        // (text, keyboard, media banner) would still show through the dialog.
+        frame.render_widget(Clear, area);
+        frame.render_widget(UiBlock::new().style(Style::new().bg(Color::Blue)), area);
         frame.render_widget(
             Paragraph::new("Exit editor?")
                 .alignment(Alignment::Center)
